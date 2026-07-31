@@ -14,8 +14,6 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- *
- * Based on target_dem_fuzzer
  */
 
 #include "config.h"
@@ -26,56 +24,27 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/bytestream.h"
 #include "libavformat/avformat.h"
-#ifdef FFMPEG_MUXER
-#include "libavformat/mux.h"
-#endif
 
 /*
- * Muxing fuzzing target.
+ * Muxer fuzzing target. The input becomes an output context that is pushed
+ * through the public muxing API, writing into a discarding AVIOContext rather
+ * than a file. The muxer driven is IAMF, whose writer reconciles an audio
+ * element's layer count and per layer channel layouts against the number of
+ * substreams, the extent of AVIAMFReconGain.recon_gain and the width of the
+ * bitstream fields they are serialized into.
  *
- * Every other target in this directory drives a decoder, an encoder, a
- * bitstream filter, a demuxer or a rescaler. Muxers were never driven by one,
- * so the whole serialization half of libavformat had no fuzzing coverage at
- * all. This target closes that gap.
- *
- * It builds a complete output context from a flat byte string and pushes it
- * through the public muxing API: avformat_alloc_output_context2(),
- * avformat_new_stream(), avformat_stream_group_create(),
- * avformat_stream_group_add_stream(), avformat_write_header(),
- * av_interleaved_write_frame() and av_write_trailer(). Nothing private is
- * touched and nothing is written to the file system: the AVIOContext handed to
- * the muxer is a discarding sink that only accounts for the bytes it is given.
- *
- * The muxer exercised is IAMF. It is the muxer with the most input derived
- * accounting in the tree: an audio element declares a number of layers and a
- * channel layout per layer, and the writer has to reconcile those against the
- * number of substreams, against the fixed extent of
- * AVIAMFReconGain.recon_gain, and against the width of the bitstream fields it
- * serializes them into. Getting that reconciliation wrong is what a fuzzer is
- * for, and reaching it needs a structurally valid stream group graph that no
- * amount of random bytes fed to a demuxer would ever produce.
- *
- * Two things about the configurations built below are deliberate and easy to
- * undo by accident.
- *
- * Opus is the only codec used. IAMF permits mp4a, Opus, fLaC and ipcm, but the
- * specification forbids recon gain parameters for fLaC and ipcm, so the writer
- * strips them for those two and the recon gain path becomes unreachable, and
- * the codec config writer does not implement mp4a at all. Switching codec
- * would make this target decorative.
- *
- * Audio elements are always CHANNEL_BASED. SCENE_BASED elements are restricted
- * to exactly one ambisonic layer, so they cannot express the multi layer
- * accounting this target exists to cover.
+ * Opus is the only codec used, because the specification forbids recon gain
+ * parameters for fLaC and ipcm and the writer strips them for both, leaving the
+ * recon gain path unreachable. Audio elements are CHANNEL_BASED unless a
+ * control bit asks otherwise, because a SCENE_BASED element is restricted to a
+ * single ambisonic layer.
  */
 
 /**
- * Sink state for the AVIOContext the muxer writes into.
- *
- * The bytes themselves are dropped; only the position and the resulting size
- * are kept, which is all the muxer ever asks for. Writing to a real file would
- * make the target non hermetic and slow, and the muxer cannot tell the
- * difference.
+ * Sink state for the AVIOContext the muxer writes into. The bytes are dropped;
+ * only the position and the resulting size are kept, which is all the muxer
+ * ever asks for. Writing to a real file would make the target non-hermetic, and
+ * the muxer cannot tell the difference.
  */
 typedef struct IOContext {
     int64_t pos;
@@ -85,11 +54,8 @@ typedef struct IOContext {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 /**
- * Bail out hard.
- *
- * Reserved for allocation failures, which are an environment problem rather
- * than a finding. A rejected configuration must never come through here: the
- * muxer returning an error is the normal, expected outcome for most inputs.
+ * End the run, for an allocation failure in the harness only; a muxing error is
+ * an ordinary outcome and returns normally instead.
  */
 static void error(const char *err)
 {
@@ -137,16 +103,16 @@ static int64_t io_seek(void *opaque, int64_t offset, int whence)
 const uint32_t maxiteration = 8096;
 
 /**
- * Nested channel layout chains for scalable audio elements.
- *
- * A scalable audio element requires every layer to be a channel mask superset
- * of its predecessor while carrying strictly more channels, so the layouts a
- * multi layer element may use are not freely chosen: they have to form a chain.
- * These are the two longest chains the loudspeaker layout tables admit, which
- * is five and four layers respectively. A layer count beyond a chain's length
- * repeats its last entry, which no longer carries more channels than its
- * predecessor and must therefore be rejected by the writer. That rejection is
- * itself worth reaching.
+ * Nested channel layout chains for scalable audio elements. Every layer of a
+ * scalable element must be a channel mask superset of its predecessor while
+ * carrying strictly more channels, so its layouts have to form a chain. The
+ * superset rule is waived for the layer following a Mono one, which is what
+ * lets a chain span six layers: the most an element may declare, and the extent
+ * of AVIAMFReconGain.recon_gain, so that chain reaches both capacities exactly
+ * while still being accepted. A layer count beyond a chain's length repeats its
+ * last layout, which no longer carries more channels than its predecessor, so
+ * the shorter chains reach the writer's refusal of that at layer counts a valid
+ * element can also have.
  */
 static const AVChannelLayout scalable_chain_a[5] = {
     AV_CHANNEL_LAYOUT_STEREO,
@@ -163,15 +129,30 @@ static const AVChannelLayout scalable_chain_b[4] = {
     AV_CHANNEL_LAYOUT_7POINT1POINT4_BACK,
 };
 
+static const AVChannelLayout scalable_chain_c[6] = {
+    AV_CHANNEL_LAYOUT_MONO,
+    AV_CHANNEL_LAYOUT_STEREO,
+    AV_CHANNEL_LAYOUT_3POINT1POINT2,
+    AV_CHANNEL_LAYOUT_5POINT1POINT2,
+    AV_CHANNEL_LAYOUT_5POINT1POINT4_BACK,
+    AV_CHANNEL_LAYOUT_7POINT1POINT4_BACK,
+};
+
+/** The chains above, in the order the input selects them. */
+static const struct {
+    const AVChannelLayout *layouts;
+    int nb_layouts;
+} scalable_chains[3] = {
+    { scalable_chain_a, FF_ARRAY_ELEMS(scalable_chain_a) },
+    { scalable_chain_b, FF_ARRAY_ELEMS(scalable_chain_b) },
+    { scalable_chain_c, FF_ARRAY_ELEMS(scalable_chain_c) },
+};
+
 /**
- * Layouts for single layer audio elements.
- *
- * A single layer element has no ordering constraint, so it can use the
- * expanded loudspeaker layouts as well as the standard ones. Several entries
- * are here for a specific reason: the low frequency effects only layout is the
- * expanded layout at index 0, and the three channel front subset is the one
- * whose channel count differs from every standard layout it shares a mask
- * prefix with.
+ * Layouts for single-layer audio elements. Such an element has no ordering
+ * constraint, so it may use the expanded loudspeaker layouts as well as the
+ * standard ones. The array covers both, including the three-channel one and the
+ * low-frequency-effects-only layout, which is the expanded layout at index 0.
  */
 static const AVChannelLayout single_layer_layouts[] = {
     AV_CHANNEL_LAYOUT_MONO,
@@ -216,49 +197,59 @@ static const AVChannelLayout single_layer_layouts[] = {
     AV_CHANNEL_LAYOUT_9POINT1POINT6,
 };
 
+/**
+ * The layout every layer of a SCENE_BASED audio element carries.
+ *
+ * A scene element describes an Ambisonics channel layout, so its layer has to
+ * be in ambisonic or in custom order. First order Ambisonics is the smallest
+ * layout in ambisonic order, and its four channels are carried by four mono
+ * substreams, since a scene element admits no coupled substream.
+ */
+static const AVChannelLayout ambisonic_layout =
+    AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER;
+
 /** Channel layouts a substream may have, indexed by channel count minus one. */
 static const AVChannelLayout substream_layouts[2] = {
     AV_CHANNEL_LAYOUT_MONO,
     AV_CHANNEL_LAYOUT_STEREO,
 };
 
-/** Sample rates that survive the muxer's stream checks. */
+/** Sample rates the substreams declare, rescaled into the codec config. */
 static const int sample_rates[4] = { 48000, 44100, 16000, 96000 };
 
 /**
- * A complete muxing scenario, derived from the trailing bytes of the input.
- *
- * Every field has a value that makes sense on its own, so the target still
- * exercises a meaningful configuration when the input is too short to carry a
- * control block.
+ * A complete muxing scenario: fuzz derived controls, each with a default so
+ * that an input too short to carry a control block still describes one.
  */
 typedef struct FuzzConfig {
     int nb_elements;        /**< audio element stream groups, 1 or 2 */
-    int nb_layers;          /**< layers per audio element, 1 to 8 */
-    int chain;              /**< nested layout chain the layers come from */
-    int custom_layers;      /**< build the layers from custom order layouts */
+    int nb_layers;          /**< layers per CHANNEL_BASED element, 1 to 8 */
+    int scene_element;
+    int scene_layers;       /**< layers per SCENE_BASED element, 0 to 2 */
+    int chain;              /**< index into scalable_chains */
+    int custom_layers;
     int single_layout;      /**< index into single_layer_layouts */
-    int mono_substreams;    /**< split channels into mono, not stereo, parts */
-    int extra_substream;    /**< add a substream the layers do not need */
-    int drop_substream;     /**< remove a substream the layers do need */
+    int mono_substreams;
+    int extra_substream;
+    int drop_substream;
     unsigned recon_gain_layers; /**< bitmask of layers flagged for recon gain */
     unsigned output_gain_flags; /**< output gain flags set on every layer */
-    int with_extradata;     /**< give the streams OpusHead extradata */
-    int with_recon_info;    /**< attach recon_gain_info to the audio element */
-    int with_demix_info;    /**< attach demixing_info to the audio element */
+    int with_extradata;
+    int with_recon_info;
+    int with_demix_info;
     int dmixp_mode;         /**< demixing mode written into the descriptor */
-    int dangling_element;   /**< point the submix at no existing element */
-    int binaural_layout;    /**< submix layout is binaural, not loudspeakers */
-    int binaural_rendering; /**< submix elements render binaurally */
-    int seekable;           /**< give the AVIOContext a seek callback */
-    int new_extradata;      /**< end with an empty packet holding extradata */
+    int dangling_element;
+    int binaural_layout;
+    int binaural_rendering;
+    int seekable;
+    int new_extradata;
     unsigned side_data;     /**< which parameter blocks to attach to packets */
-    int nb_subblocks;       /**< subblocks in the parameter block side data */
+    int nb_subblocks;
     int sample_rate;
     int frame_size;
-    unsigned mix_id;        /**< parameter id of the mix gain definitions */
-    unsigned demix_id;      /**< parameter id of the demixing definitions */
-    unsigned recon_id;      /**< parameter id of the recon gain definitions */
+    unsigned mix_id;
+    unsigned demix_id;
+    unsigned recon_id;
     int io_buffer_size;
     int max_pkt_size;
     uint8_t recon_seed[8];  /**< expanded into the recon gain matrix */
@@ -268,11 +259,8 @@ static void config_defaults(FuzzConfig *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
 
-    /*
-     * A two layer scalable element with recon gain on both layers and a recon
-     * gain parameter block on every packet, which is the shortest path to the
-     * code this target was written for.
-     */
+    /* A two layer scalable element with recon gain on both layers, and a recon
+     * gain parameter block on every packet. */
     cfg->nb_elements       = 1;
     cfg->nb_layers         = 2;
     cfg->single_layout     = 1;
@@ -303,7 +291,14 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     unsigned flags3 = bytestream2_get_byte(gbc);
 
     cfg->nb_elements        = 1 + !!(flags1 & 0x01);
-    cfg->chain              = !!(flags1 & 0x02);
+    /*
+     * Three chains to choose from need two bits, and flags1 has only one to
+     * give, so the high bit is borrowed from flags3, which has bits to spare.
+     * Keeping the low bit where it was leaves every field that follows at the
+     * offset it already had.
+     */
+    cfg->chain              = ((!!(flags3 & 0x04) << 1) | !!(flags1 & 0x02)) %
+                              FF_ARRAY_ELEMS(scalable_chains);
     cfg->mono_substreams    = !!(flags1 & 0x04);
     cfg->extra_substream    = !!(flags1 & 0x08);
     cfg->drop_substream     = !!(flags1 & 0x10);
@@ -319,6 +314,7 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     cfg->side_data          = (flags2 >> 5) & 7;
 
     cfg->custom_layers      = !!(flags3 & 0x01);
+    cfg->scene_element      = !!(flags3 & 0x02);
 
     /*
      * One to eight layers. Seven is one past the extent of
@@ -327,23 +323,23 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
      * capacities the layer count is measured against have to be reachable.
      */
     cfg->nb_layers          = 1 + bytestream2_get_byte(gbc) % 8;
+    /* No layer, one or two. A scene element may only have one, and a count of
+     * none requires the count to be checked before the first layer is read. */
+    cfg->scene_layers       = bytestream2_get_byte(gbc) % 3;
     cfg->single_layout      = bytestream2_get_byte(gbc) %
                               FF_ARRAY_ELEMS(single_layer_layouts);
     cfg->nb_subblocks       = 1 + bytestream2_get_byte(gbc) % 3;
     cfg->dmixp_mode         = bytestream2_get_byte(gbc) & 7;
     cfg->output_gain_flags  = bytestream2_get_byte(gbc) & 0x3F;
-    /* Layer 0 always carries recon gain so the matrix is always indexed. */
+    /* Bit 0 is forced, so layer 0 stays eligible for recon gain coverage. */
     cfg->recon_gain_layers  = bytestream2_get_byte(gbc) | 1;
     cfg->sample_rate        = sample_rates[bytestream2_get_byte(gbc) %
                                            FF_ARRAY_ELEMS(sample_rates)];
     cfg->frame_size         = bytestream2_get_le16(gbc) & 0xFFF;
 
-    /*
-     * Parameter ids are kept in a small range on purpose, so that the
-     * definitions of an audio element and those of a mix presentation collide
-     * often. A collision makes the writer resolve a packet's parameter block
-     * against a definition of a different type, which is a path of its own.
-     */
+    /* Parameter ids stay in a small range so that the definitions of an audio
+     * element and those of a mix presentation collide often, which makes the
+     * writer resolve a packet's block against a definition of another type. */
     cfg->mix_id             = bytestream2_get_le32(gbc) & 0xFF;
     cfg->demix_id           = bytestream2_get_le32(gbc) & 0xFF;
     cfg->recon_id           = bytestream2_get_le32(gbc) & 0xFF;
@@ -363,38 +359,41 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     bytestream2_get_buffer(gbc, cfg->recon_seed, sizeof(cfg->recon_seed));
 }
 
-/** The layout of layer @p idx in an element that has @p nb_layers layers. */
+static int element_nb_layers(const FuzzConfig *cfg)
+{
+    return cfg->scene_element ? cfg->scene_layers : cfg->nb_layers;
+}
+
+/**
+ * The layout of layer @p idx. An element with more layers than its chain is
+ * long repeats the chain's last layout, which no longer carries more channels
+ * than its predecessor and is refused for that reason.
+ */
 static const AVChannelLayout *layer_layout(const FuzzConfig *cfg, int idx,
                                            int nb_layers)
 {
     const AVChannelLayout *chain;
     int len;
 
+    /* The layer of a scene element describes Ambisonics, not loudspeakers, and
+     * the chains below say nothing about how those layers may be stacked. */
+    if (cfg->scene_element)
+        return &ambisonic_layout;
+
     if (nb_layers == 1)
         return &single_layer_layouts[cfg->single_layout];
 
-    if (cfg->chain) {
-        chain = scalable_chain_b;
-        len   = (int)FF_ARRAY_ELEMS(scalable_chain_b);
-    } else {
-        chain = scalable_chain_a;
-        len   = (int)FF_ARRAY_ELEMS(scalable_chain_a);
-    }
+    chain = scalable_chains[cfg->chain].layouts;
+    len   = scalable_chains[cfg->chain].nb_layouts;
 
     return &chain[FFMIN(idx, len - 1)];
 }
 
 /**
- * Give @p dst the channel layout of layer @p idx.
- *
- * The custom order form is the interesting one. A custom order layout may name
- * the same channel more than once, so every layer of the chain built here shows
- * the very same channel mask while carrying one channel more than the layer
- * before it. Matching a layer to a loudspeaker layout by channel mask alone
- * accepts all of them, which is how a chain of any length can be assembled and
- * how a layer ends up matched to a layout that carries fewer channels than the
- * layer really has. Requiring the channel count to agree as well is what turns
- * that into a rejection, and both answers are worth reaching.
+ * Give @p dst the channel layout of layer @p idx. A custom order layout may
+ * name the same channel more than once, so the custom form builds layers that
+ * all share one channel mask while each carries one channel more than the one
+ * before it.
  */
 static int set_layer_layout(AVChannelLayout *dst, const FuzzConfig *cfg,
                             int idx, int nb_layers)
@@ -415,7 +414,6 @@ static int set_layer_layout(AVChannelLayout *dst, const FuzzConfig *cfg,
     return 0;
 }
 
-/** The number of channels the layout of layer @p idx carries. */
 static int layer_nb_channels(const FuzzConfig *cfg, int idx, int nb_layers)
 {
     if (cfg->custom_layers)
@@ -425,26 +423,30 @@ static int layer_nb_channels(const FuzzConfig *cfg, int idx, int nb_layers)
 }
 
 /**
- * Work out how the layers' channels are spread over substreams.
+ * Spread the layers' channels over substreams. Each layer adds channels on top
+ * of its predecessor, and every increment is split over substreams of one or
+ * two channels. The extra and dropped substream knobs break that accounting by
+ * one substream in either direction. An element declaring no layer still gets
+ * one mono substream, because a stream group without a stream is refused before
+ * its layer count is read.
  *
- * Each layer adds a number of channels on top of its predecessor, and those
- * channels are carried by one or more substreams of one or two channels each.
- * Splitting every increment exactly is what a valid element looks like; the
- * extra and dropped substream knobs then break the accounting in the two ways
- * the writer has to notice, one substream too many and one too few.
- *
+ * @param nb_layers how many layers the element declares
  * @return the number of substreams written to @p channels.
  */
-static int plan_substreams(const FuzzConfig *cfg, uint8_t *channels, int max)
+static int plan_substreams(const FuzzConfig *cfg, int nb_layers,
+                           uint8_t *channels, int max)
 {
     int nb = 0, prev = 0;
 
-    for (int i = 0; i < cfg->nb_layers && nb < max; i++) {
-        int delta = layer_nb_channels(cfg, i, cfg->nb_layers) - prev;
+    for (int i = 0; i < nb_layers && nb < max; i++) {
+        int delta = layer_nb_channels(cfg, i, nb_layers) - prev;
 
         prev += delta;
         while (delta > 0 && nb < max) {
-            int nb_channels = delta >= 2 && !cfg->mono_substreams ? 2 : 1;
+            /* Every substream of a scene element carries one channel: the
+             * writer refuses a wider one for Ambisonics in mono mode. */
+            int nb_channels = delta >= 2 && !cfg->mono_substreams &&
+                              !cfg->scene_element ? 2 : 1;
 
             channels[nb++] = nb_channels;
             delta -= nb_channels;
@@ -455,7 +457,6 @@ static int plan_substreams(const FuzzConfig *cfg, uint8_t *channels, int max)
         nb--;
     if (cfg->extra_substream && nb < max)
         channels[nb++] = 1;
-    /* An audio element without a single stream is refused before it is read. */
     if (!nb)
         channels[nb++] = 1;
 
@@ -463,13 +464,10 @@ static int plan_substreams(const FuzzConfig *cfg, uint8_t *channels, int max)
 }
 
 /**
- * An Opus identification header, in the form the muxer expects it.
- *
- * The IAMF codec configuration writer only accepts an Opus identification
- * header of exactly nineteen bytes, and byte swaps it into the big endian form
- * the specification asks for, so anything else is rejected outright. These same
- * nineteen bytes are what an empty packet later offers as replacement
- * extradata, which sends the writer through that conversion a second time.
+ * An Opus identification header, in the form the muxer expects it. The IAMF
+ * codec configuration writer accepts exactly nineteen bytes and byte swaps them
+ * into the big-endian form the specification asks for. The same bytes are
+ * offered again as replacement extradata, repeating that conversion.
  */
 static const uint8_t opus_head[19] = {
     'O', 'p', 'u', 's', 'H', 'e', 'a', 'd',
@@ -511,18 +509,18 @@ static AVIAMFParamDefinition *alloc_param(enum AVIAMFParamDefinitionType type,
 
 
 /**
- * Build one CHANNEL_BASED audio element stream group and its substreams.
- *
- * The stream group pre-allocates its AVIAMFAudioElement, so the object is
- * populated in place rather than replaced, and everything hung off it,
- * including the parameter definitions, is freed by avformat_free_context().
+ * Build one audio element stream group and its substreams. The stream group
+ * pre-allocates its AVIAMFAudioElement, so the object is populated in place
+ * rather than replaced, and everything hung off it, including the parameter
+ * definitions, is freed by avformat_free_context().
  *
  * @param index which audio element this is, used to keep ids apart
  */
 static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
-                            int index)
+                             int index)
 {
     uint8_t substream_channels[32];
+    const int nb_layers = element_nb_layers(cfg);
     AVIAMFAudioElement *ae;
     AVStreamGroup *stg;
     int nb_substreams, ret;
@@ -534,16 +532,18 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
 
     stg->id = index + 1;
     ae = stg->params.iamf_audio_element;
-    ae->audio_element_type = AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL;
+    ae->audio_element_type = cfg->scene_element ?
+                             AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE :
+                             AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL;
     ae->default_w = 10;
 
-    for (int i = 0; i < cfg->nb_layers; i++) {
+    for (int i = 0; i < nb_layers; i++) {
         AVIAMFLayer *layer = av_iamf_audio_element_add_layer(ae);
 
         if (!layer)
             return AVERROR(ENOMEM);
 
-        ret = set_layer_layout(&layer->ch_layout, cfg, i, cfg->nb_layers);
+        ret = set_layer_layout(&layer->ch_layout, cfg, i, nb_layers);
         if (ret < 0)
             return ret;
 
@@ -557,11 +557,12 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
     }
 
     /*
-     * The demixing and recon gain parameters are mandatory for a scalable
-     * element once it has more than one layer, so they are always provided in
-     * that case and only optional for a single layer element.
+     * Recon gain is mandatory once a scalable element has more than one layer,
+     * unless the codec is fLaC or ipcm. Demixing is mandatory only for the
+     * higher multi layer layouts, and is supplied for every multi layer element
+     * so that its descriptor is written either way.
      */
-    if (cfg->with_demix_info || cfg->nb_layers > 1) {
+    if (cfg->with_demix_info || nb_layers > 1) {
         AVIAMFParamDefinition *demix;
         AVIAMFDemixingInfo *info;
 
@@ -575,7 +576,7 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
         info = av_iamf_param_definition_get_subblock(demix, 0);
         info->dmixp_mode = cfg->dmixp_mode;
     }
-    if (cfg->with_recon_info || cfg->nb_layers > 1) {
+    if (cfg->with_recon_info || nb_layers > 1) {
         AVIAMFParamDefinition *recon;
 
         recon = alloc_param(AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN, 1);
@@ -586,7 +587,7 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
         recon->parameter_id = cfg->recon_id + index;
     }
 
-    nb_substreams = plan_substreams(cfg, substream_channels,
+    nb_substreams = plan_substreams(cfg, nb_layers, substream_channels,
                                     FF_ARRAY_ELEMS(substream_channels));
 
     for (int i = 0; i < nb_substreams; i++) {
@@ -682,12 +683,8 @@ static int add_mix_presentation(AVFormatContext *oc, const FuzzConfig *cfg)
         element->element_mix_config->parameter_id   = cfg->mix_id;
         element->element_mix_config->parameter_rate = cfg->sample_rate;
 
-        /*
-         * A submix may name an audio element that was never declared. The
-         * writer has to resolve that reference while serializing the mix
-         * presentation and report it, so both the resolvable and the dangling
-         * case are worth producing.
-         */
+        /* An id that matches no audio element exercises the reference
+         * validation the writer performs on a submix. */
         element->audio_element_id = cfg->dangling_element ? UINT_MAX - i
                                                           : (unsigned)(i + 1);
         element->headphones_rendering_mode = cfg->binaural_rendering ?
@@ -710,7 +707,6 @@ static int add_mix_presentation(AVFormatContext *oc, const FuzzConfig *cfg)
             return ret;
     }
 
-    /* A mix presentation covers every stream the audio elements contributed. */
     for (unsigned i = 0; i < oc->nb_streams; i++) {
         ret = avformat_stream_group_add_stream(stg, oc->streams[i]);
         if (ret < 0)
@@ -786,38 +782,38 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
     return param;
 }
 
-/** Copy a parameter block onto a packet as side data of the matching type. */
+/**
+ * Copy a parameter block onto a packet as side data of the matching type. The
+ * buffer is sized exactly to the parameter block and handed over rather than
+ * copied into one of the padded buffers av_packet_new_side_data() returns, so a
+ * read past its end reaches a sanitizer's redzone, not padding.
+ */
 static int attach_param_block(AVPacket *pkt, enum AVPacketSideDataType type,
                               const AVIAMFParamDefinition *param, size_t size)
 {
     uint8_t *side_data;
+    int ret;
 
     if (!param)
         return 0;
 
-    side_data = av_packet_new_side_data(pkt, type, size);
+    side_data = av_memdup(param, size);
     if (!side_data)
         return AVERROR(ENOMEM);
 
-    memcpy(side_data, param, size);
+    ret = av_packet_add_side_data(pkt, type, side_data, size);
+    if (ret < 0)
+        av_free(side_data);
 
-    return 0;
+    return ret;
 }
 
 /**
- * Mux one session described by @p data.
- *
- * The trailing bytes of the input, if there are enough of them, describe the
- * scenario; everything before them becomes the payload of the packets. The
- * sequence is always the same, and mirrors what any application does: allocate
- * the output context, declare the streams and the stream groups, write the
- * header, write packets, write the trailer.
- *
- * Every one of those steps may fail, and for most scenarios one of them will,
- * because that is precisely what the muxer's validation is for. A failure is
- * therefore the ordinary outcome and is never reported: the return value is
- * always zero, and the process is only ever ended by a genuine allocation
- * failure. What a run is looking for is a sanitizer report or a crash.
+ * Mux one session described by @p data. The trailing bytes of the input
+ * describe the scenario, if there are enough of them, and everything before
+ * them becomes packet payload, so a given input always describes the same
+ * session. Most scenarios are refused somewhere along the way, which is an
+ * ordinary outcome and is not reported.
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     AVIAMFParamDefinition *recon_block = NULL, *demix_block = NULL;
@@ -834,28 +830,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static int c;
     int ret;
 
-#ifdef FFMPEG_MUXER
-#define MUXER_SYMBOL0(MUXER) ff_##MUXER##_muxer
-#define MUXER_SYMBOL(MUXER) MUXER_SYMBOL0(MUXER)
-    extern const FFOutputFormat MUXER_SYMBOL(FFMPEG_MUXER);
-    ofmt = &MUXER_SYMBOL(FFMPEG_MUXER).p;
-#else
-    /*
-     * Nothing names a muxer at build time, so the one this target was written
-     * around is looked up through the public API instead. Doing it at run time
-     * is what keeps the object free of any build time dependency on that muxer
-     * being enabled, which matters because a configuration without it simply
-     * has nothing here to test.
-     */
+    /* A run time lookup keeps the object usable without the muxer enabled. */
     ofmt = av_guess_format("iamf", NULL, NULL);
-#endif
 
     if (!c) {
         av_log_set_level(AV_LOG_PANIC);
         c = 1;
     }
 
-    /* Not built with the muxer, so there is nothing to test and no finding. */
     if (!ofmt)
         return 0;
 
@@ -884,13 +866,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         error("Failed to allocate io_buffer");
 
     /*
-     * The output is a sink that counts bytes and throws them away: a fuzz
-     * target must not touch the file system, and nothing here needs to read
-     * back what was written. The third argument marks the context writable and
-     * the callback goes in the write slot, which is what makes the muxer use
-     * it. A seek callback is supplied only for some of the scenarios, because
-     * the muxer takes a different route through the trailer depending on
-     * whether the output can be seeked.
+     * The output is a sink that counts bytes and drops them, so nothing reaches
+     * the file system. The third argument marks the context writable and the
+     * callback goes in the write slot. A seek callback is supplied only for
+     * some scenarios, because the muxer takes a different route through the
+     * trailer when the output is seekable.
      */
     fuzzed_pb = avio_alloc_context(io_buffer, cfg.io_buffer_size, 1, &opaque,
                                    NULL, io_write,
@@ -916,27 +896,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (ret < 0)
         goto fail;
 
-    /*
-     * Everything the writer decides about the layer count, the channel layouts
-     * of the layers, the substream accounting and the references a submix makes
-     * is reported from here. An error is the normal answer for most scenarios
-     * and means nothing more than that the input was refused, which is the
-     * whole point of the validation being there.
-     */
+    /* An invalid stream group configuration is refused here. */
     ret = avformat_write_header(oc, NULL);
     if (ret < 0)
         goto fail;
 
-    /* A header cannot have been written without a stream to write it for. */
     if (!oc->nb_streams)
         goto fail;
 
-    /*
-     * The parameter blocks travel as packet side data, and the writer resolves
-     * each one against the definitions the descriptors declared. The recon gain
-     * block is the interesting one: its matrix is indexed once per layer, so it
-     * is what measures the layer count against the capacity of that matrix.
-     */
+    /* Recon gain side data is what makes the writer index its matrix once per
+     * layer. */
     if (cfg.side_data & 1)
         recon_block = param_block(AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
                                   &cfg, cfg.recon_id, &recon_size);
@@ -987,10 +956,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     /*
      * An empty packet carrying new extradata makes the muxer replace the codec
-     * configuration of the substream it names and, when the output can be
-     * seeked, rewrite the descriptors from the trailer. That is a second pass
-     * over the whole descriptor serializer, with a configuration that was built
-     * while packets were already being written.
+     * configuration of the substream it names and, when the output is seekable,
+     * rewrite the descriptors from the trailer. That is a second pass over the
+     * descriptor serializer, with a configuration built while packets were
+     * already being written.
      */
     if (cfg.new_extradata) {
         uint8_t *side_data;
@@ -1010,7 +979,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         av_interleaved_write_frame(oc, pkt);
     }
 
-    /* Flushes what interleaving still holds and finishes the descriptors. */
     av_write_trailer(oc);
 
 fail:

@@ -228,6 +228,21 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
         return AVERROR(EINVAL);
     }
 
+    /* An IAMF substream carries either one channel or a coupled stereo pair. Any other
+     * width can't be accounted for by the substream and coupled substream counts derived
+     * from it below, and would leave the amount of channels the element declares at odds
+     * with the amount its substreams add up to. Same widths the parser assigns when
+     * demuxing. */
+    for (int i = 0; i < stg->nb_streams; i++) {
+        const int nb_channels = stg->streams[i]->codecpar->ch_layout.nb_channels;
+
+        if (nb_channels < 1 || nb_channels > 2) {
+            av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of channels %d in stream %d from Audio Element id %"PRId64
+                   ". Must be 1 or 2\n", nb_channels, i, stg->id);
+            return AVERROR(EINVAL);
+        }
+    }
+
     iamf_audio_element = stg->params.iamf_audio_element;
     if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
         if (iamf_audio_element->nb_layers != 1) {
@@ -298,6 +313,20 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
                     av_bprint_finalize(&bp, NULL);
                     return AVERROR(EINVAL);
                 }
+
+                /* A layer only the expanded table matches is written as loudspeaker_layout
+                 * 15 followed by an expanded_loudspeaker_layout, and that field is only
+                 * present when num_layers is one. Same invariant the parser enforces when
+                 * demuxing. */
+                if (iamf_audio_element->nb_layers != 1) {
+                    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
+                    av_channel_layout_describe_bprint(&layer->ch_layout, &bp);
+                    av_log(log_ctx, AV_LOG_ERROR, "Expanded channel layout in Audio Element id %"PRId64
+                           ", Layer %d: %s. Only an Audio Element with a single layer may use one\n",
+                           stg->id, i, bp.str);
+                    av_bprint_finalize(&bp, NULL);
+                    return AVERROR(EINVAL);
+                }
             }
 
             if (!i)
@@ -305,8 +334,12 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
 
             const AVIAMFLayer *prev_layer = iamf_audio_element->layers[i-1];
             uint64_t prev_mask = av_channel_layout_subset(&prev_layer->ch_layout, UINT64_MAX);
-            if (av_channel_layout_subset(&layer->ch_layout, prev_mask) != prev_mask || (layer->ch_layout.nb_channels <=
-                                                                                        prev_layer->ch_layout.nb_channels)) {
+            /* A layer carries the channels of the one before it plus at least one more,
+             * except after a Mono layer, which the layer following it may drop the center
+             * channel of. Same exception the parser makes when demuxing. */
+            if ((prev_layer->ch_layout.nb_channels > 1 &&
+                 av_channel_layout_subset(&layer->ch_layout, prev_mask) != prev_mask) ||
+                layer->ch_layout.nb_channels <= prev_layer->ch_layout.nb_channels) {
                 av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
                 av_bprintf(&bp, "Channel layout \"");
                 av_channel_layout_describe_bprint(&layer->ch_layout, &bp);

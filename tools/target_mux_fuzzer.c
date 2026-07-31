@@ -31,6 +31,25 @@
  * writer reconciles an element's layer count and layouts against the substream
  * count, recon_gain's extent and the fields these are serialized into. Only
  * Opus is used, as recon gain is stripped for fLaC and ipcm.
+ *
+ * The input's leading CONTROL_BLOCK_SIZE bytes are the scenario, one knob per
+ * byte and every one of them optional, and the input in full is the payload the
+ * packets carry; see config_parse(). A single byte already selects a scenario,
+ * so no seed corpus is needed to reach them: the decoder, encoder and bitstream
+ * filter targets keep their controls past a size threshold instead, which suits
+ * them because their leading bytes are a coded bitstream that earns coverage on
+ * its own and so grows an input up to that threshold. A muxer copies a packet's
+ * bytes out verbatim, so here nothing below a threshold could earn any, and the
+ * controls behind one would stay unreachable however long a campaign ran.
+ *
+ * A libFuzzer toolchain is what links this target:
+ *   ./configure --toolchain=clang-asan-fuzz --assert-level=2 --enable-gpl \
+ *               --enable-nonfree --enable-memory-poisoning
+ *   make tools/target_mux_fuzzer
+ * Any toolchain whose sanitizer list holds fuzz works, as does --libfuzzer=PATH
+ * on its own. --enable-ossfuzz is not one of them and must not stand in for
+ * them: it leaves LIBFUZZER_PATH empty, so the link fails on an undefined main,
+ * and it stubs out the codec list, leaving a binary with next to no encoders.
  */
 
 /** Byte sink for the muxer's output; dropping the bytes keeps this hermetic. */
@@ -184,6 +203,13 @@ static const AVChannelLayout substream_layouts[2] = {
 
 static const int sample_rates[4] = { 48000, 44100, 16000, 96000 };
 
+/**
+ * Leading bytes of the input config_parse() can consume: the whole scenario
+ * space fits in this one flat block, so no input has to be longer to reach any
+ * part of it, and a shorter one reaches the block's leading knobs.
+ */
+#define CONTROL_BLOCK_SIZE 29
+
 /** A muxing scenario: fuzz-derived controls, each with a default. */
 typedef struct FuzzConfig {
     int nb_elements;        /**< audio element stream groups, 1 or 2 */
@@ -248,17 +274,48 @@ static void config_defaults(FuzzConfig *cfg)
         cfg->recon_seed[i] = i & 1 ? 0 : 1 + i * 31;
 }
 
+/**
+ * Take the control block's next byte into @p val, or report that the block ran
+ * out so the caller stops and every knob it did not reach keeps its default.
+ */
+static int config_byte(GetByteContext *gbc, unsigned *val)
+{
+    if (bytestream2_get_bytes_left(gbc) < 1)
+        return 0;
+
+    *val = bytestream2_get_byte(gbc);
+
+    return 1;
+}
+
+/** As config_byte(), for the knobs that want more than a byte of range. */
+static int config_le16(GetByteContext *gbc, unsigned *val)
+{
+    if (bytestream2_get_bytes_left(gbc) < 2)
+        return 0;
+
+    *val = bytestream2_get_le16(gbc);
+
+    return 1;
+}
+
+/**
+ * Derive a scenario from the control block, at most one knob per byte and in a
+ * fixed order, so a block of n bytes refines the default scenario in its first
+ * n knobs and leaves the rest alone. Every added byte therefore reaches one
+ * more knob, which is the gradient libFuzzer needs to grow an input by itself.
+ */
 static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
 {
-    unsigned flags1 = bytestream2_get_byte(gbc);
-    unsigned flags2 = bytestream2_get_byte(gbc);
-    unsigned flags3 = bytestream2_get_byte(gbc);
+    unsigned flags1 = 0, flags3 = 0, v = 0;
+
+    if (!config_byte(gbc, &flags1))
+        return;
 
     cfg->nb_elements        = 1 + !!(flags1 & 0x01);
-    /* Three chains need two bits and flags1 has one to give, so the high bit
-     * comes from flags3; the low bit stays put to keep the later offsets. */
-    cfg->chain              = ((!!(flags3 & 0x04) << 1) | !!(flags1 & 0x02)) %
-                              FF_ARRAY_ELEMS(scalable_chains);
+    /* Three chains need two bits and flags1 has one to give; the other comes
+     * from flags3 below, until which this one selects on its own. */
+    cfg->chain              = !!(flags1 & 0x02);
     cfg->mono_substreams    = !!(flags1 & 0x04);
     cfg->extra_substream    = !!(flags1 & 0x08);
     cfg->drop_substream     = !!(flags1 & 0x10);
@@ -266,49 +323,113 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     cfg->binaural_layout    = !!(flags1 & 0x40);
     cfg->seekable           = !!(flags1 & 0x80);
 
-    cfg->with_extradata     = !!(flags2 & 0x01);
-    cfg->with_recon_info    = !!(flags2 & 0x02);
-    cfg->with_demix_info    = !!(flags2 & 0x04);
-    cfg->new_extradata      = !!(flags2 & 0x08);
-    cfg->binaural_rendering = !!(flags2 & 0x10);
-    cfg->side_data          = (flags2 >> 5) & 7;
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->with_extradata     = !!(v & 0x01);
+    cfg->with_recon_info    = !!(v & 0x02);
+    cfg->with_demix_info    = !!(v & 0x04);
+    cfg->new_extradata      = !!(v & 0x08);
+    cfg->binaural_rendering = !!(v & 0x10);
+    cfg->side_data          = (v >> 5) & 7;
+
+    if (!config_byte(gbc, &flags3))
+        return;
 
     cfg->custom_layers      = !!(flags3 & 0x01);
     cfg->scene_element      = !!(flags3 & 0x02);
+    cfg->chain              = ((!!(flags3 & 0x04) << 1) | cfg->chain) %
+                              FF_ARRAY_ELEMS(scalable_chains);
+
+    if (!config_byte(gbc, &v))
+        return;
 
     /* Seven is one past recon_gain's extent and eight the first value the three
      * bit num_layers field cannot hold, so both capacities stay reachable. */
-    cfg->nb_layers          = 1 + bytestream2_get_byte(gbc) % 8;
+    cfg->nb_layers          = 1 + v % 8;
+
+    if (!config_byte(gbc, &v))
+        return;
+
     /* A scene element may have only one layer; none must be caught early. */
-    cfg->scene_layers       = bytestream2_get_byte(gbc) % 3;
-    cfg->single_layout      = bytestream2_get_byte(gbc) %
-                              FF_ARRAY_ELEMS(single_layer_layouts);
-    cfg->nb_subblocks       = 1 + bytestream2_get_byte(gbc) % 3;
-    cfg->dmixp_mode         = bytestream2_get_byte(gbc) & 7;
-    cfg->output_gain_flags  = bytestream2_get_byte(gbc) & 0x3F;
+    cfg->scene_layers       = v % 3;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->single_layout      = v % FF_ARRAY_ELEMS(single_layer_layouts);
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->nb_subblocks       = 1 + v % 3;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->dmixp_mode         = v & 7;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->output_gain_flags  = v & 0x3F;
+
+    if (!config_byte(gbc, &v))
+        return;
+
     /* Bit 0 is forced, so layer 0 stays eligible for recon gain coverage. */
-    cfg->recon_gain_layers  = bytestream2_get_byte(gbc) | 1;
-    cfg->sample_rate        = sample_rates[bytestream2_get_byte(gbc) %
-                                           FF_ARRAY_ELEMS(sample_rates)];
-    cfg->frame_size         = bytestream2_get_le16(gbc) & 0xFFF;
+    cfg->recon_gain_layers  = v | 1;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->sample_rate        = sample_rates[v % FF_ARRAY_ELEMS(sample_rates)];
+
+    if (!config_le16(gbc, &v))
+        return;
+
+    cfg->frame_size         = v & 0xFFF;
 
     /* A small range makes element and mix ids collide often, so the writer
      * resolves a packet's block against a definition of another type. */
-    cfg->mix_id             = bytestream2_get_le32(gbc) & 0xFF;
-    cfg->demix_id           = bytestream2_get_le32(gbc) & 0xFF;
-    cfg->recon_id           = bytestream2_get_le32(gbc) & 0xFF;
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->mix_id             = v;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->demix_id           = v;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->recon_id           = v;
 
     /* A small AVIO buffer is worth exercising but must not be zero, or the
-     * write path can never flush. Not FFMAX(): it consumes the input twice. */
-    cfg->io_buffer_size     = bytestream2_get_le32(gbc) & 0xFFFF;
-    if (cfg->io_buffer_size < 64)
-        cfg->io_buffer_size = 64;
-    cfg->max_pkt_size       = 1 + (bytestream2_get_le16(gbc) & 0xFFF);
+     * write path can never flush. */
+    if (!config_le16(gbc, &v))
+        return;
 
-    bytestream2_get_buffer(gbc, cfg->recon_seed, sizeof(cfg->recon_seed));
+    cfg->io_buffer_size     = FFMAX((int)v, 64);
 
-    /* Read last so every field above keeps the offset it already had. */
-    cfg->grow_layers        = bytestream2_get_byte(gbc) % 4;
+    if (!config_le16(gbc, &v))
+        return;
+
+    cfg->max_pkt_size       = 1 + (v & 0xFFF);
+
+    for (int i = 0; i < (int)FF_ARRAY_ELEMS(cfg->recon_seed); i++) {
+        if (!config_byte(gbc, &v))
+            return;
+
+        cfg->recon_seed[i] = v;
+    }
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->grow_layers        = v % 4;
 }
 
 static int element_nb_layers(const FuzzConfig *cfg)
@@ -712,8 +833,8 @@ static int attach_param_block(AVPacket *pkt, enum AVPacketSideDataType type,
 }
 
 /**
- * Mux one session described by @p data: its trailing bytes carry the scenario,
- * if there are enough of them, and the rest becomes packet payload. Most
+ * Mux one session described by @p data: its leading bytes carry the scenario,
+ * as far as they reach, and the input in full is the packet payload. Most
  * scenarios are refused somewhere, which is ordinary and not reported.
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
@@ -729,6 +850,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     IOContext opaque = { 0 };
     const uint8_t *end;
     uint8_t *io_buffer;
+    GetByteContext gbc;
     FuzzConfig cfg;
     static int c;
     int ret;
@@ -744,14 +866,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (!ofmt)
         return 0;
 
+    /* The control block is the input's leading bytes, however few there are, so
+     * every input steers the scenario and none has to reach a length first. The
+     * bytes are payload as well: a muxer copies a packet's bytes out untouched,
+     * so which ones they are decides nothing and withholding them from the
+     * payload would only keep short inputs from reaching the write path. */
     config_defaults(&cfg);
-    if (size > 1024) {
-        GetByteContext gbc;
+    bytestream2_init(&gbc, data, (int)FFMIN(size, (size_t)CONTROL_BLOCK_SIZE));
+    config_parse(&cfg, &gbc);
 
-        size -= 1024;
-        bytestream2_init(&gbc, data + size, 1024);
-        config_parse(&cfg, &gbc);
-    }
     end = data + size;
 
     ret = avformat_alloc_output_context2(&oc, ofmt, NULL, NULL);

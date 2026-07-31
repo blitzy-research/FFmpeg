@@ -32,7 +32,7 @@
 #include "libavcodec/codec_par.h"
 
 #define MAX_IAMF_OBU_HEADER_SIZE (1 + 8 * 3)
-// 3 bit num_layers (section 3.6.2), and AVIAMFReconGain.recon_gain's extent.
+// IAMF's six-layer limit (section 3.6.2) matches AVIAMFReconGain.recon_gain's rows.
 #define MAX_IAMF_LAYERS 6
 
 // OBU types (section 3.2).

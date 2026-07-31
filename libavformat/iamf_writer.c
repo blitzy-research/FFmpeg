@@ -234,7 +234,8 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of layers for SCENE_BASED audio element. Must be 1\n");
             return AVERROR(EINVAL);
         }
-        /* Only dereference layers[] once the guard above has established it is populated. */
+
+        /* Only valid once the guard above established that a layer is present. */
         const AVIAMFLayer *layer = iamf_audio_element->layers[0];
         if (layer->ch_layout.order != AV_CHANNEL_ORDER_CUSTOM &&
             layer->ch_layout.order != AV_CHANNEL_ORDER_AMBISONIC) {
@@ -254,15 +255,16 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
     } else {
         AVBPrint bp;
 
-        /* The layer count doubles as the loop bound over AVIAMFReconGain.recon_gain,
-         * whose extent is MAX_IAMF_LAYERS, and as the value of the 3 bit num_layers
-         * field written by scalable_channel_layout_config(), so it has to be bounded
-         * above as well as below. Same invariant the parser enforces on demuxing. */
+        /* The layer count is both the bound of the loop that indexes
+         * AVIAMFReconGain.recon_gain, whose extent is MAX_IAMF_LAYERS, and the value of
+         * the 3 bit num_layers field written by scalable_channel_layout_config(), so it
+         * has to be bounded above as well as below. Same invariant the parser enforces
+         * when demuxing. */
         if (iamf_audio_element->nb_layers < 1 ||
             iamf_audio_element->nb_layers > MAX_IAMF_LAYERS) {
-            av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of layers for CHANNEL_BASED audio element."
-                   " Must be >= 1 and <= %d, got %u\n",
-                   MAX_IAMF_LAYERS, iamf_audio_element->nb_layers);
+            av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of layers %u in Audio Element id %"PRId64
+                   " for CHANNEL_BASED audio element. Must be >= 1 and <= %d\n",
+                   iamf_audio_element->nb_layers, stg->id, MAX_IAMF_LAYERS);
             return AVERROR(EINVAL);
         }
 
@@ -270,9 +272,10 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             const AVIAMFLayer *layer = iamf_audio_element->layers[i];
 
             /* Matching by channel mask alone lets a custom order layout that repeats a
-             * channel pass as a smaller standard layout, so the amount of channels the
-             * layer actually carries ends up disagreeing with the layout serialized for
-             * it and with every capacity derived from that layout. Require both. */
+             * channel pass as a standard layout carrying fewer channels, leaving the
+             * amount of channels the layer actually has at odds with the layout
+             * serialized for it and with every capacity derived from that layout.
+             * Require the channel count to agree as well. */
             for (j = 0; j < FF_ARRAY_ELEMS(ff_iamf_scalable_ch_layouts); j++)
                 if (av_channel_layout_subset(&layer->ch_layout, UINT64_MAX) ==
                     av_channel_layout_subset(&ff_iamf_scalable_ch_layouts[j], UINT64_MAX) &&
@@ -379,13 +382,12 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             goto fail;
         }
     }
-
-    /* The layers must between them account for every substream. Any left over stays a
+    /* The layers must between them account for every substream. Any left over remains a
      * zero initialized entry of the array allocated above and would be serialized as a
-     * phantom substream. Same cross-check the parser applies on demuxing. */
+     * phantom substream. Same cross-check the parser applies when demuxing. */
     if (j != stg->nb_streams) {
-        av_log(log_ctx, AV_LOG_ERROR, "Invalid substream count in stream group %u:"
-               " its layers account for %d of %u substreams\n",
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid substream count in stream group %u: its layers "
+               "account for %d of %u substreams\n",
                stg->index, j, stg->nb_streams);
         ret = AVERROR(EINVAL);
         goto fail;
@@ -623,8 +625,8 @@ static void get_loudspeaker_layout(const AVIAMFLayer *layer,
             break;
     }
     if (layout >= FF_ARRAY_ELEMS(ff_iamf_scalable_ch_layouts)) {
-        /* Mask only fallback: it must agree with the channel count too, exactly as the
-         * matching done when the audio element was added does. */
+        /* Mask only fallback, so it has to require the channel count to agree too,
+         * exactly like the matching done when the audio element was added. */
         for (layout = 0; layout < FF_ARRAY_ELEMS(ff_iamf_scalable_ch_layouts); layout++)
             if (av_channel_layout_subset(&layer->ch_layout, UINT64_MAX) ==
                 av_channel_layout_subset(&ff_iamf_scalable_ch_layouts[layout], UINT64_MAX) &&
@@ -645,8 +647,8 @@ static void get_loudspeaker_layout(const AVIAMFLayer *layer,
                     break;
         }
     }
-    /* expanded_layout starts at -1 and only holds a table index once matched, so index 0,
-     * the LFE only expanded layout, is a match like any other. */
+    /* expanded_layout is initialized to -1 above and only ever set to a matching index,
+     * so index 0, the LFE only layout, is a valid result and not a failure to match. */
     av_assert0((expanded_layout >= 0 && expanded_layout < FF_ARRAY_ELEMS(ff_iamf_expanded_scalable_ch_layouts)) ||
                layout < FF_ARRAY_ELEMS(ff_iamf_scalable_ch_layouts));
 
@@ -938,12 +940,13 @@ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
                     break;
                 }
 
-            /* A submix may reference an id no audio element carries, which is invalid
-             * input rather than a broken invariant, so report it instead of asserting. */
+            /* The search above may legitimately fail to match, so this is input
+             * validation and must not be an assertion. */
             if (!audio_element) {
-                av_log(log_ctx, AV_LOG_ERROR, "Submix %d from Mix Presentation id #%u references "
-                       "non-existent Audio Element id %u\n",
-                       j, mix_presentation->mix_presentation_id, submix_element->audio_element_id);
+                av_log(log_ctx, AV_LOG_ERROR, "Invalid Audio Element id %u referenced by element %d in submix %d "
+                                              "from Mix Presentation id #%u\n",
+                       submix_element->audio_element_id, j, i,
+                       mix_presentation->mix_presentation_id);
                 return AVERROR(EINVAL);
             }
             ffio_write_leb(dyn_bc, submix_element->audio_element_id);
@@ -1166,10 +1169,10 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
                 return AVERROR(EINVAL);
             }
 
-            /* Bound the loop by the extent of the matrix it indexes and not only by the
-             * layer count validated when the audio element was added, so no caller can
-             * make this read, and emit, memory past recon_gain's allocation. */
-            for (int j = 0; j < FFMIN(audio_element->nb_layers, FF_ARRAY_ELEMS(recon->recon_gain)); j++) {
+            const int nb_layers = FFMIN(audio_element->nb_layers,
+                                        FF_ARRAY_ELEMS(recon->recon_gain));
+
+            for (int j = 0; j < nb_layers; j++) {
                 const AVIAMFLayer *layer = audio_element->layers[j];
 
                 if (layer->flags & AV_IAMF_LAYER_FLAG_RECON_GAIN) {

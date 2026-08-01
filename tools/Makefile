@@ -39,5 +39,10 @@ OUTDIRS += tools
 
 clean::
 	$(RM) $(CLEANSUFFIXES:%=tools/%)
+# The fuzz targets are built on request only, so they are not in TOOLS and the
+# clean rule that covers that variable does not reach them. CLEANSUFFIXES only
+# matches suffixes, which an executable has none of on most platforms, so name
+# the one added here explicitly.
+	$(RM) tools/target_mux_fuzzer$(EXESUF)
 
 -include $(wildcard tools/*.d)

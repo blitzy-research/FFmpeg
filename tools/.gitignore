@@ -25,6 +25,7 @@
 /target_io_dem_fuzzer
 /target_sws_fuzzer
 /target_swr_fuzzer
+/target_mux_fuzzer
 /trasher
 /seek_print
 /uncoded_frame

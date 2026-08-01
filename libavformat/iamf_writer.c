@@ -398,7 +398,7 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
      * fills in when demuxing. */
     audio_element->nb_layers = iamf_audio_element->nb_layers;
 
-    int j = 0;
+    int substream_idx = 0;
     for (int i = 0; i < iamf_audio_element->nb_layers; i++) {
         int nb_channels = iamf_audio_element->layers[i]->ch_layout.nb_channels;
 
@@ -406,9 +406,9 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
 
         if (i)
             nb_channels -= iamf_audio_element->layers[i - 1]->ch_layout.nb_channels;
-        for (; nb_channels > 0 && j < stg->nb_streams; j++) {
-            const AVStream *st = stg->streams[j];
-            IAMFSubStream *substream = &audio_element->substreams[j];
+        for (; nb_channels > 0 && substream_idx < stg->nb_streams; substream_idx++) {
+            const AVStream *st = stg->streams[substream_idx];
+            IAMFSubStream *substream = &audio_element->substreams[substream_idx];
 
             substream->audio_substream_id = st->id;
             layer->substream_count++;
@@ -425,10 +425,10 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
     /* The layers must between them account for every substream. Any left over remains a
      * zero initialized entry of the array allocated above and would be serialized as a
      * phantom substream. Same cross-check the parser applies when demuxing. */
-    if (j != stg->nb_streams) {
+    if (substream_idx != stg->nb_streams) {
         av_log(log_ctx, AV_LOG_ERROR, "Invalid substream count in stream group %u: its layers "
                "account for %d of %u substreams\n",
-               stg->index, j, stg->nb_streams);
+               stg->index, substream_idx, stg->nb_streams);
         ret = AVERROR(EINVAL);
         goto fail;
     }
@@ -646,11 +646,12 @@ static int iamf_write_codec_config(const IAMFContext *iamf,
     avio_write(pb, header, put_bytes_count(&pbc, 1));
     ffio_write_leb(pb, dyn_size);
     avio_write(pb, dyn_buf, dyn_size);
-    ffio_free_dyn_buf(&dyn_bc);
-
-    return 0;
+    ret = 0;
+/* Every exit past avio_open_dyn_buf() comes through here, or the partially
+ * serialized OBU leaks. */
 fail:
     ffio_free_dyn_buf(&dyn_bc);
+
     return ret;
 }
 
@@ -954,11 +955,12 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
     avio_write(pb, header, put_bytes_count(&pbc, 1));
     ffio_write_leb(pb, dyn_size);
     avio_write(pb, dyn_buf, dyn_size);
-    ffio_free_dyn_buf(&dyn_bc);
-
-    return 0;
+    ret = 0;
+/* Every exit past avio_open_dyn_buf() comes through here, or the partially
+ * serialized OBU leaks. */
 fail:
     ffio_free_dyn_buf(&dyn_bc);
+
     return ret;
 }
 
@@ -1108,17 +1110,80 @@ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
     avio_write(pb, header, put_bytes_count(&pbc, 1));
     ffio_write_leb(pb, dyn_size);
     avio_write(pb, dyn_buf, dyn_size);
-    ffio_free_dyn_buf(&dyn_bc);
-
-    return 0;
+    ret = 0;
+/* Every exit past avio_open_dyn_buf() comes through here, or the partially
+ * serialized OBU leaks. */
 fail:
     ffio_free_dyn_buf(&dyn_bc);
+
     return ret;
+}
+
+/**
+ * Resolve the Audio Element a submix element references.
+ *
+ * @return the Audio Element carrying @p audio_element_id, or NULL if no Audio Element
+ *         was added under that id.
+ */
+static const IAMFAudioElement *find_audio_element(const IAMFContext *iamf,
+                                                  unsigned audio_element_id)
+{
+    for (int i = 0; i < iamf->nb_audio_elements; i++)
+        if (iamf->audio_elements[i]->audio_element_id == audio_element_id)
+            return iamf->audio_elements[i];
+
+    return NULL;
+}
+
+/**
+ * Check that every submix element of every Mix Presentation references an Audio Element
+ * that exists.
+ *
+ * A Mix Presentation is serialized after the Sequence Header, the Codec Configs and the
+ * Audio Elements, so resolving these references while serializing it would only reject
+ * the mismatch once those OBUs had already been emitted. This runs before any of them is
+ * written instead, so nothing at all is emitted for a Mix Presentation that names an
+ * Audio Element that was never added.
+ *
+ * The check belongs here rather than in ff_iamf_add_mix_presentation() because a Mix
+ * Presentation may be added before the Audio Element it references: both muxers add the
+ * stream groups they are given, and libavformat/movenc.c adds them in the order they
+ * appear in the AVFormatContext. Refusing a reference that is merely not resolvable yet
+ * would reject a configuration that is valid today. Every Audio Element is known by the
+ * time the descriptors are written, whatever order the stream groups were in.
+ */
+static int validate_mix_presentations(const IAMFContext *iamf, void *log_ctx)
+{
+    for (int i = 0; i < iamf->nb_mix_presentations; i++) {
+        const IAMFMixPresentation *mix_presentation = iamf->mix_presentations[i];
+        const AVIAMFMixPresentation *mix = mix_presentation->cmix;
+
+        for (int j = 0; j < mix->nb_submixes; j++) {
+            const AVIAMFSubmix *submix = mix->submixes[j];
+
+            for (int k = 0; k < submix->nb_elements; k++) {
+                unsigned audio_element_id = submix->elements[k]->audio_element_id;
+
+                if (!find_audio_element(iamf, audio_element_id)) {
+                    av_log(log_ctx, AV_LOG_ERROR, "Invalid Audio Element id %u referenced by element %d "
+                                                  "in submix %d from Mix Presentation id #%u\n",
+                           audio_element_id, k, j, mix_presentation->mix_presentation_id);
+                    return AVERROR(EINVAL);
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 int ff_iamf_write_descriptors(const IAMFContext *iamf, AVIOContext *pb, void *log_ctx)
 {
     int ret;
+
+    ret = validate_mix_presentations(iamf, log_ctx);
+    if (ret < 0)
+        return ret;
 
     // Sequence Header
     avio_w8(pb, IAMF_OBU_IA_SEQUENCE_HEADER << 3);
@@ -1279,11 +1344,12 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
     dyn_size = avio_get_dyn_buf(dyn_bc, &dyn_buf);
     ffio_write_leb(pb, dyn_size);
     avio_write(pb, dyn_buf, dyn_size);
-    ffio_free_dyn_buf(&dyn_bc);
-
-    return 0;
+    ret = 0;
+/* Every exit past avio_open_dyn_buf() comes through here, or the partially
+ * serialized OBU leaks. */
 fail:
     ffio_free_dyn_buf(&dyn_bc);
+
     return ret;
 }
 

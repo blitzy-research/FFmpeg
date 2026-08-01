@@ -1309,6 +1309,11 @@ fail:
 /**
  * Resolve the sound_system a submix layout's channel layout is serialized as.
  *
+ * iamf_write_mixing_presentation() writes the index this returns, so deciding it in its
+ * own function lets validate_mix_presentation() refuse a layout no sound system describes
+ * before ff_iamf_write_descriptors() has written anything, out of the same comparison the
+ * serializer makes rather than out of a second copy of it.
+ *
  * @return an index into ff_iamf_sound_system_map, or a negative AVERROR code if no sound
  *         system describes @p ch_layout, in which case the layout cannot be serialized.
  */

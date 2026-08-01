@@ -819,10 +819,12 @@ static int get_loudspeaker_layout(const AVIAMFLayer *layer,
                     break;
         }
     }
-    /* expanded_layout is initialized to -1 above and only ever set to a matching index,
-     * so index 0, the LFE-only layout, is a valid result and not a failure to match.
-     * A layer matching neither table has no layout to be written as; the layouts come
-     * from input, so that is reported and refused rather than asserted on. */
+    /* A match leaves expanded_layout within the expanded table, index 0, the LFE-only
+     * layout, included; searching that table and matching nothing leaves it at the table's
+     * extent, and a layer a standard loudspeaker layout describes leaves it at -1, never
+     * having searched it. A layer neither table describes has no layout to be written as;
+     * the layouts come from input, so that is reported and refused rather than asserted
+     * on. */
     if (!((expanded_layout >= 0 && expanded_layout < FF_ARRAY_ELEMS(ff_iamf_expanded_scalable_ch_layouts)) ||
           layout < FF_ARRAY_ELEMS(ff_iamf_scalable_ch_layouts))) {
         AVBPrint bp;
@@ -1584,7 +1586,6 @@ static int validate_audio_element(const IAMFContext *iamf,
             return AVERROR(EINVAL);
         }
 
-        /* Only valid once the guard above established that a layer is present. */
         layer = element->layers[0];
         /* ambisonics_config() writes the channel ids out of the custom order map, so a
          * layer that is no longer ambisonic has none to be serialized from. */
@@ -1768,9 +1769,9 @@ static int validate_audio_elements(const IAMFContext *iamf, void *log_ctx)
  * ff_iamf_add_mix_presentation() because a Mix Presentation may be added before the Audio
  * Element it references: both muxers add the stream groups they are given, and
  * libavformat/movenc.c adds them in the order they appear in the AVFormatContext. Refusing
- * a reference that is merely not resolvable yet would reject a configuration that is valid
- * today. Every Audio Element is known by the time the descriptors are written, whatever
- * order the stream groups were in.
+ * a reference that is merely not resolvable yet would reject a configuration that becomes
+ * valid once the remaining stream groups have been added. Every Audio Element is known by
+ * the time the descriptors are written, whatever order the stream groups were in.
  */
 static int validate_mix_presentation(const IAMFContext *iamf,
                                      const IAMFMixPresentation *mix_presentation,

@@ -32,36 +32,28 @@
  * count, recon_gain's extent and the fields these are serialized into. Only
  * Opus is used, as recon gain is stripped for fLaC and ipcm.
  *
- * The input's leading CONTROL_BLOCK_SIZE bytes are the scenario, one knob per
- * byte and every one of them optional, and the input in full is the payload the
- * packets carry; see config_parse(). A single byte already selects a scenario,
- * so no seed corpus is needed to reach them: the decoder, encoder and bitstream
- * filter targets keep their controls past a size threshold instead, which suits
- * them because their leading bytes are a coded bitstream that earns coverage on
- * its own and so grows an input up to that threshold. A muxer copies a packet's
- * bytes out verbatim, so here nothing below a threshold could earn any, and the
- * controls behind one would stay unreachable however long a campaign ran.
+ * The input's leading CONTROL_BLOCK_SIZE bytes are the scenario, one optional
+ * knob per byte, and the input in full is the payload the packets carry; see
+ * config_parse(). They lead rather than trail so that a single byte already
+ * selects a scenario: a muxer copies a packet's bytes out verbatim, so an input
+ * earns no coverage by growing towards controls kept behind a size threshold.
  *
- * A session may also be initialized in a step of its own before its header is
- * written, which is what the public API offers and what leaves a stream group
- * writable after the muxer has already validated it. A control bit takes that
- * route, and further ones append layers to an audio element, replace a layer it
- * was validated with, and append a submix, an element or a layout to a mix
- * presentation, either while the session is open or after the header; see
- * apply_mutations(). A configuration then reaches the descriptor and parameter
- * block serializers describing something other than the one the muxer checked.
- * What the muxer accepts is judged too, by rejection_reason() and by those
- * changes: a guard that stops refusing an invalid configuration serializes it
- * instead of faulting.
+ * The public API also allows a session to be initialized in a step of its own
+ * before its header is written, which leaves a stream group writable after the
+ * muxer has already validated it. Control bits take that route and mutate the
+ * graph in that window and after the header: appending layers to an audio
+ * element, replacing a layer it was validated with, and appending a submix, an
+ * element or a layout to a mix presentation; see apply_mutations(). The
+ * descriptor and parameter block serializers then meet something other than
+ * what the muxer checked. What the muxer accepts is judged too, by
+ * rejection_reason(): a guard that stops refusing an invalid configuration
+ * serializes it instead of faulting.
  *
- * A libFuzzer toolchain is what links this target:
- *   ./configure --toolchain=clang-asan-fuzz --assert-level=2 --enable-gpl \
- *               --enable-nonfree --enable-memory-poisoning
- *   make tools/target_mux_fuzzer
- * Any toolchain whose sanitizer list holds fuzz works, as does --libfuzzer=PATH
- * on its own. --enable-ossfuzz is not one of them and must not stand in for
- * them: it leaves LIBFUZZER_PATH empty, so the link fails on an undefined main,
- * and it stubs out the codec list, leaving a binary with next to no encoders.
+ * Linking this target needs a toolchain that supplies libFuzzer, or an explicit
+ * --libfuzzer=PATH. --enable-ossfuzz is neither, and must not stand in for one:
+ * it leaves LIBFUZZER_PATH empty, so the link fails on an undefined main, and
+ * it stubs the codec list out to NULL entries, leaving a binary with no
+ * encoders.
  */
 
 /** Byte sink for the muxer's output; dropping the bytes keeps this hermetic. */
@@ -240,9 +232,11 @@ static const AVChannelLayout single_layer_layouts[] = {
 };
 
 /**
- * A SCENE_BASED element's layer must be ambisonic or custom-order, and first
- * order is the smallest such layout: four channels over four mono substreams,
- * a scene element admitting no coupled one.
+ * The layout a SCENE_BASED element's layer is given for the ordinary form at
+ * the four channels this predefined first order one describes: four mono
+ * substreams, a scene element admitting no coupled one. The other forms and
+ * channel counts are given a custom order map or a projection layout instead,
+ * by set_layer_layout(), so that channel mapping is exercised too.
  */
 static const AVChannelLayout ambisonic_layout =
     AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER;
@@ -702,8 +696,10 @@ static int set_layer_layout(AVChannelLayout *dst, const FuzzConfig *cfg,
     if (cfg->scene_element) {
         const int nb_channels = scene_nb_channels(cfg);
 
-        /* A native order Ambisonics layout only exists for a complete order, so
-         * anything else has to be described as a custom order map. */
+        /* The predefined first order layout, for the ordinary form at the four
+         * channels it describes. A projection form is handled just below, and
+         * everything else is given a custom order map, deliberately, so that
+         * the ACN indices a map is serialized as are exercised too. */
         if (cfg->scene_mode == SCENE_AMBISONIC && nb_channels == 4)
             return av_channel_layout_copy(dst, &ambisonic_layout);
 

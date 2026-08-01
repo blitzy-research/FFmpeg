@@ -59,7 +59,8 @@ fate-iamf-ambisonic_1-projection: CMD = transcode wav $(SRC) iamf "-auto_convers
   "-show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_stream=index,id:stream_group_stream_disposition"
 
 FATE_IAMF-$(call TRANSCODE, FLAC, IAMF, WAV_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-iamf-lfe
-fate-iamf-lfe: tests/data/asynth-44100-2.wav tests/data/filtergraphs/iamf_lfe tests/data/streamgroups/audio_element-lfe tests/data/streamgroups/mix_presentation-lfe
+fate-iamf-lfe: tests/data/asynth-44100-2.wav tests/data/filtergraphs/iamf_lfe \
+  tests/data/streamgroups/audio_element-lfe tests/data/streamgroups/mix_presentation-lfe
 fate-iamf-lfe: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
 fate-iamf-lfe: CMD = transcode wav $(SRC) iamf "-auto_conversion_filters \
   -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/iamf_lfe \
@@ -69,7 +70,8 @@ fate-iamf-lfe: CMD = transcode wav $(SRC) iamf "-auto_conversion_filters \
   "-show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_stream=index,id:stream_group_stream_disposition"
 
 FATE_IAMF-$(call TRANSCODE, FLAC, IAMF, WAV_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-iamf-expanded-3_0
-fate-iamf-expanded-3_0: tests/data/asynth-44100-4.wav tests/data/filtergraphs/iamf_3_0 tests/data/streamgroups/audio_element-3_0 tests/data/streamgroups/mix_presentation-ambisonic_1
+fate-iamf-expanded-3_0: tests/data/asynth-44100-4.wav tests/data/filtergraphs/iamf_3_0 \
+  tests/data/streamgroups/audio_element-3_0 tests/data/streamgroups/mix_presentation-ambisonic_1
 fate-iamf-expanded-3_0: SRC = $(TARGET_PATH)/tests/data/asynth-44100-4.wav
 fate-iamf-expanded-3_0: CMD = transcode wav $(SRC) iamf "-auto_conversion_filters \
   -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/iamf_3_0 \

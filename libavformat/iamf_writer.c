@@ -214,6 +214,49 @@ static int add_param_definition(IAMFContext *iamf, AVIAMFParamDefinition *param,
     return 0;
 }
 
+/**
+ * Check that a Parameter Definition carries the type the role naming it mandates.
+ *
+ * A Parameter Definition is resolved by parameter id alone, so what a descriptor is
+ * serialized out of is whichever definition was registered under that id first, whatever
+ * the object naming it holds. Where a role is written, both have to be of its type, or a
+ * recon_gain_info would be serialized out of a demixing definition: the type is written to
+ * the bitstream ahead of the definition, so the two would disagree in the descriptor itself
+ * and be read back as a kind of parameter the definition never was.
+ *
+ * @param param            the definition the role's owner carries
+ * @param param_definition what is registered under @p param's id and what the role is
+ *                         therefore serialized out of, or NULL to require only the type of
+ *                         the definition @p param itself is. An id may legitimately be
+ *                         shared with a role that is never serialized, and which definition
+ *                         a role is written out of is not settled until it is written, so
+ *                         only a role actually being serialized may require the registered
+ *                         one to agree. NULL is not an error.
+ * @param type             the type the role mandates
+ * @param name             the role, for the diagnostic
+ * @return 0, or AVERROR(EINVAL) having reported which type does not match
+ */
+static int check_param_definition_type(const AVIAMFParamDefinition *param,
+                                       const IAMFParamDefinition *param_definition,
+                                       enum AVIAMFParamDefinitionType type,
+                                       const char *name, void *log_ctx)
+{
+    if (param->type != type) {
+        av_log(log_ctx, AV_LOG_ERROR, "Parameter Definition with ID %u in %s is of type %d. "
+               "Must be %d\n", param->parameter_id, name, param->type, type);
+        return AVERROR(EINVAL);
+    }
+
+    if (param_definition && param_definition->param->type != type) {
+        av_log(log_ctx, AV_LOG_ERROR, "Parameter Definition with ID %u in %s is registered "
+               "with type %d. Must be %d\n", param->parameter_id, name,
+               param_definition->param->type, type);
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
 int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void *log_ctx)
 {
     const AVIAMFAudioElement *iamf_audio_element;
@@ -257,7 +300,11 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             av_log(log_ctx, AV_LOG_ERROR, "Invalid channel layout for SCENE_BASED audio element\n");
             return AVERROR(EINVAL);
         }
-        if (layer->ambisonics_mode > AV_IAMF_AMBISONICS_MODE_PROJECTION) {
+        /* Compared against the modes themselves rather than bounded from above, the field
+         * being an enum whose underlying type may be signed, which would let a negative
+         * value pass a bound and reach a serializer that has no branch for it. */
+        if (layer->ambisonics_mode != AV_IAMF_AMBISONICS_MODE_MONO &&
+            layer->ambisonics_mode != AV_IAMF_AMBISONICS_MODE_PROJECTION) {
             av_log(log_ctx, AV_LOG_ERROR, "Unsupported ambisonics mode %d\n", layer->ambisonics_mode);
             return AVERROR_PATCHWELCOME;
         }
@@ -460,6 +507,17 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             goto fail;
         }
 
+        /* Only the type of the definition the role carries can be required here. Whether
+         * this role ends up serialized at all depends on the layers and the codec, and is
+         * not decided until the descriptor is written, so an id shared with a role that is
+         * never written is not a conflict. iamf_write_audio_element() requires the
+         * registered definition to agree for the roles it does write. */
+        ret = check_param_definition_type(param, NULL,
+                                          AV_IAMF_PARAMETER_DEFINITION_DEMIXING,
+                                          "demixing_info", log_ctx);
+        if (ret < 0)
+            goto fail;
+
         if (!param_definition) {
             ret = add_param_definition(iamf, param, audio_element, log_ctx);
             if (ret < 0)
@@ -475,6 +533,12 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void 
             ret = AVERROR(EINVAL);
             goto fail;
         }
+
+        ret = check_param_definition_type(param, NULL,
+                                          AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
+                                          "recon_gain_info", log_ctx);
+        if (ret < 0)
+            goto fail;
 
         if (!param_definition) {
             ret = add_param_definition(iamf, param, audio_element, log_ctx);
@@ -537,6 +601,12 @@ int ff_iamf_add_mix_presentation(IAMFContext *iamf, const AVStreamGroup *stg, vo
         }
 
         param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+        ret = check_param_definition_type(param, param_definition,
+                                          AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                          "output_mix_config", log_ctx);
+        if (ret < 0)
+            goto fail;
+
         if (!param_definition) {
             ret = add_param_definition(iamf, param, NULL, log_ctx);
             if (ret < 0)
@@ -554,6 +624,12 @@ int ff_iamf_add_mix_presentation(IAMFContext *iamf, const AVStreamGroup *stg, vo
                 goto fail;
             }
             param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+            ret = check_param_definition_type(param, param_definition,
+                                              AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                              "element_mix_config", log_ctx);
+            if (ret < 0)
+                goto fail;
+
             if (!param_definition) {
                 ret = add_param_definition(iamf, param, NULL, log_ctx);
                 if (ret < 0)
@@ -667,6 +743,34 @@ static inline int rescale_rational(AVRational q, int b)
 }
 
 /**
+ * Check that a rational the caller supplied may be scaled into the fixed point form
+ * these descriptors carry.
+ *
+ * rescale_rational() and the subblock writers scale a rational with av_rescale(), which
+ * requires a positive denominator: a non-positive one is only objected to by av_assert2,
+ * compiled out of a default build, and yields INT64_MIN instead, so the value serialized
+ * would be the clip of that rather than anything the caller expressed. The numerator is
+ * left unconstrained, every one of these fields being documented as a range around zero
+ * and serialized into a signed field.
+ *
+ * @param field what the rational is, for the diagnostic
+ * @param where what carries it, for the diagnostic
+ * @param idx   index of @p where among its siblings, for the diagnostic
+ * @return 0, or AVERROR(EINVAL) having reported the offending value
+ */
+static int check_rational(AVRational q, const char *field,
+                          const char *where, int idx, void *log_ctx)
+{
+    if (q.den > 0)
+        return 0;
+
+    av_log(log_ctx, AV_LOG_ERROR, "%s %d carries an invalid %s %d/%d. The denominator "
+           "must be positive\n", where, idx, field, q.num, q.den);
+
+    return AVERROR(EINVAL);
+}
+
+/**
  * Resolve the loudspeaker_layout, and where only an expanded loudspeaker layout
  * describes it the expanded_loudspeaker_layout, a layer's channel layout is
  * serialized as.
@@ -775,7 +879,13 @@ static int scalable_channel_layout_config(const IAMFAudioElement *audio_element,
         if (layer->output_gain_flags) {
             put_bits(&pb, 6, layer->output_gain_flags);
             put_bits(&pb, 2, 0);
-            put_bits(&pb, 16, rescale_rational(layer->output_gain, 1 << 8));
+            /* output_gain is a signed 16 bit field, and rescale_rational() returns the
+             * signed value it holds. put_bits() takes an unsigned one and only objects to
+             * a wider value under av_assert2, compiled out of a default build, where a
+             * negative gain would instead be written across the bits around it. Narrow it
+             * to the field's two's complement form here, which is the form the parser
+             * sign extends back. */
+            put_bits(&pb, 16, rescale_rational(layer->output_gain, 1 << 8) & 0xFFFF);
         }
         if (expanded_layout >= 0)
             put_bits(&pb, 8, expanded_layout);
@@ -786,15 +896,130 @@ static int scalable_channel_layout_config(const IAMFAudioElement *audio_element,
     return 0;
 }
 
+/**
+ * Check that a SCENE_BASED Audio Element's layer describes an Ambisonics configuration
+ * ambisonics_config() can serialize in full.
+ *
+ * Every invariant here mirrors the one libavformat/iamf_parse.c enforces on the same field
+ * when demuxing, so a configuration accepted for writing is one that parser reads back:
+ * the mode selects between the two serializations and nothing else has one at all;
+ * output_channel_count, substream_count and coupled_substream_count each go into a single
+ * byte; output_channel_count is a complete ambisonic order; a custom order map is written
+ * out as one ACN index per channel, so it may only name ambisonic channels whose index fits
+ * that byte; and a projection mode reads a demixing matrix whose extent the counts fix.
+ *
+ * Only valid once the caller has established that a layer is present.
+ */
+static int check_ambisonics_layer(const IAMFAudioElement *audio_element, void *log_ctx)
+{
+    const AVIAMFLayer *layer = audio_element->celement->layers[0];
+    const IAMFLayer *ilayer = &audio_element->layers[0];
+    const int nb_channels = layer->ch_layout.nb_channels;
+    int order = 0;
+
+    /* Each mode selects a serialization of its own and a third value has none. Compared
+     * against the modes themselves rather than bounded from above, the field being an enum
+     * whose underlying type may be signed, which would let a negative value pass a bound
+     * and then match neither branch below. */
+    if (layer->ambisonics_mode != AV_IAMF_AMBISONICS_MODE_MONO &&
+        layer->ambisonics_mode != AV_IAMF_AMBISONICS_MODE_PROJECTION) {
+        av_log(log_ctx, AV_LOG_ERROR, "Unsupported ambisonics mode %d in Audio Element id %u\n",
+               layer->ambisonics_mode, audio_element->audio_element_id);
+        return AVERROR_PATCHWELCOME;
+    }
+
+    /* Serialized into the single byte output_channel_count field. */
+    if (nb_channels < 1 || nb_channels > UINT8_MAX) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of channels %d in Audio Element id %u. "
+               "Must be >= 1 and <= %d\n",
+               nb_channels, audio_element->audio_element_id, UINT8_MAX);
+        return AVERROR(EINVAL);
+    }
+    /* An Ambisonics layout carries every harmonic up to its order, so the channel count is
+     * (order + 1)^2. Searched for rather than computed from a square root, so no floating
+     * point is needed; the bound above keeps the search to at most sixteen steps. */
+    while ((order + 1) * (order + 1) < nb_channels)
+        order++;
+    if ((order + 1) * (order + 1) != nb_channels) {
+        av_log(log_ctx, AV_LOG_ERROR, "Incomplete ambisonic order for %d channels in Audio "
+               "Element id %u. Some harmonics are missing\n",
+               nb_channels, audio_element->audio_element_id);
+        return AVERROR(EINVAL);
+    }
+
+    /* substream_count is serialized from the substreams the element was given, into a
+     * single byte, and the count recorded for the layer is what everything else is
+     * accounted against. */
+    if (audio_element->nb_substreams != ilayer->substream_count) {
+        av_log(log_ctx, AV_LOG_ERROR, "Audio Element id %u carries %u substreams, %u accounted "
+               "for by its layer\n", audio_element->audio_element_id,
+               audio_element->nb_substreams, ilayer->substream_count);
+        return AVERROR(EINVAL);
+    }
+    if (audio_element->nb_substreams > UINT8_MAX ||
+        ilayer->coupled_substream_count > UINT8_MAX) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid substream counts %u and %u in Audio Element id "
+               "%u. Both must be <= %d\n", audio_element->nb_substreams,
+               ilayer->coupled_substream_count, audio_element->audio_element_id, UINT8_MAX);
+        return AVERROR(EINVAL);
+    }
+
+    if (layer->ambisonics_mode == AV_IAMF_AMBISONICS_MODE_MONO) {
+        /* A custom order map is serialized as the ACN index of each channel it names, one
+         * byte each, so a channel that is not an ambisonic one has no index to be written
+         * as. Same range the parser produces, reading a byte and adding the base to it. */
+        if (layer->ch_layout.order == AV_CHANNEL_ORDER_CUSTOM)
+            for (int i = 0; i < nb_channels; i++) {
+                const int id = layer->ch_layout.u.map[i].id;
+
+                if (id < AV_CHAN_AMBISONIC_BASE ||
+                    id > AV_CHAN_AMBISONIC_BASE + UINT8_MAX) {
+                    av_log(log_ctx, AV_LOG_ERROR, "Channel %d of Audio Element id %u is not an "
+                           "Ambisonics channel with an ACN index that fits in one byte\n",
+                           i, audio_element->audio_element_id);
+                    return AVERROR(EINVAL);
+                }
+            }
+    } else {
+        /* The demixing matrix is read once per substream and channel, so the counts above
+         * fix its extent, and it has to be there to be read at all: a layer may carry a
+         * matching count with no matrix set. */
+        const unsigned nb_demixing_matrix =
+            (ilayer->substream_count + ilayer->coupled_substream_count) * nb_channels;
+
+        if (!layer->demixing_matrix || layer->nb_demixing_matrix != nb_demixing_matrix) {
+            av_log(log_ctx, AV_LOG_ERROR, "Audio Element id %u declares %u demixing matrix "
+                   "entries%s, %u accounted for by its substreams and channels\n",
+                   audio_element->audio_element_id, layer->nb_demixing_matrix,
+                   layer->demixing_matrix ? "" : " with no matrix set", nb_demixing_matrix);
+            return AVERROR(EINVAL);
+        }
+
+        /* Every entry is scaled into a signed fixed point field. */
+        for (int i = 0; i < layer->nb_demixing_matrix; i++) {
+            int ret = check_rational(layer->demixing_matrix[i], "value",
+                                     "Demixing matrix entry", i, log_ctx);
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    return 0;
+}
+
 static int ambisonics_config(const IAMFAudioElement *audio_element,
-                             AVIOContext *dyn_bc)
+                             AVIOContext *dyn_bc, void *log_ctx)
 {
     const AVIAMFAudioElement *element = audio_element->celement;
     const IAMFLayer *ilayer = &audio_element->layers[0];
     const AVIAMFLayer *layer = element->layers[0];
+    /* Checked again here, and not only by the validation pass running before any of this,
+     * so nothing below is reached with a configuration it has no serialization for however
+     * this function is arrived at. */
+    int ret = check_ambisonics_layer(audio_element, log_ctx);
 
-    if (audio_element->nb_substreams != ilayer->substream_count)
-        return AVERROR(EINVAL);
+    if (ret < 0)
+        return ret;
 
     ffio_write_leb(dyn_bc, layer->ambisonics_mode);
     avio_w8(dyn_bc, layer->ch_layout.nb_channels); // output_channel_count
@@ -805,12 +1030,12 @@ static int ambisonics_config(const IAMFAudioElement *audio_element,
             for (int i = 0; i < layer->ch_layout.nb_channels; i++)
                 avio_w8(dyn_bc, i);
         else
+            /* channel_mapping is a list of ACN indices, which is what an ambisonic channel
+             * id is relative to AV_CHAN_AMBISONIC_BASE, and the form the parser reads back
+             * by adding that base to the byte it read. */
             for (int i = 0; i < layer->ch_layout.nb_channels; i++)
-                avio_w8(dyn_bc, layer->ch_layout.u.map[i].id);
+                avio_w8(dyn_bc, layer->ch_layout.u.map[i].id - AV_CHAN_AMBISONIC_BASE);
     } else {
-        int nb_demixing_matrix = (ilayer->coupled_substream_count + ilayer->substream_count) * layer->ch_layout.nb_channels;
-        if (nb_demixing_matrix != layer->nb_demixing_matrix)
-            return AVERROR(EINVAL);
         avio_w8(dyn_bc, ilayer->coupled_substream_count);
         for (int i = 0; i < layer->nb_demixing_matrix; i++)
             avio_wb16(dyn_bc, rescale_rational(layer->demixing_matrix[i], 1 << 15));
@@ -869,19 +1094,119 @@ static int param_definition(const IAMFContext *iamf,
     return 0;
 }
 
+/**
+ * Resolve which Parameter Definition types an Audio Element's descriptor declares.
+ *
+ * Every decision here describes what iamf_write_audio_element() is about to serialize, and
+ * two of them refuse the element outright: a scalable element whose highest loudspeaker
+ * layout needs demixing information it was not given, and one that needs recon gain
+ * information and was not given that. Deciding it in its own function lets
+ * validate_audio_element() reach the same verdict before ff_iamf_write_descriptors() has
+ * written a single OBU, so an Audio Element that cannot be described produces a diagnostic
+ * and no output at all, rather than a Sequence Header and a Codec Config followed by an
+ * error.
+ *
+ * @param types set to the mask of AVIAMFParamDefinitionType values the descriptor declares.
+ *              Zero for a scene based element, which declares none.
+ * @return 0, or a negative AVERROR code if no descriptor can be written for @p audio_element
+ */
+static int get_param_definition_types(const IAMFContext *iamf,
+                                      const IAMFAudioElement *audio_element,
+                                      int *types, void *log_ctx)
+{
+    const AVIAMFAudioElement *element = audio_element->celement;
+    const IAMFCodecConfig *codec_config = iamf->codec_configs[audio_element->codec_config_id];
+    int param_definition_types = AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+    int layout = 0, expanded_layout = 0, ret;
+    unsigned nb_layers;
+
+    *types = 0;
+
+    /* When audio_element_type = 1, num_parameters SHALL be set to 0 */
+    if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE)
+        return 0;
+
+    /* Every decision below describes the layers scalable_channel_layout_config() is
+     * about to serialize, so it has to read the same validated layer count that
+     * function does rather than the one in the AVIAMFAudioElement, which the caller
+     * may have grown since this element was added. */
+    nb_layers = FFMIN(audio_element->nb_layers, MAX_IAMF_LAYERS);
+
+    ret = get_loudspeaker_layout(element->layers[0], &layout, &expanded_layout, log_ctx);
+    if (ret < 0)
+        return ret;
+
+    /* When the loudspeaker_layout = 15, the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
+    if (layout == 15) {
+        param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+        /* expanded_loudspeaker_layout SHALL only be present when num_layers = 1 and loudspeaker_layout is set to 15 */
+        if (nb_layers > 1) {
+            av_log(log_ctx, AV_LOG_ERROR, "expanded_loudspeaker_layout present when using more than one layer in "
+                                          "Stream Group #%u\n",
+                   audio_element->audio_element_id);
+            return AVERROR(EINVAL);
+        }
+    }
+    /* When the loudspeaker_layout of the (non-)scalable channel audio (i.e., num_layers = 1) is less than or equal to 3.1.2ch,
+     * (i.e., Mono, Stereo, or 3.1.2ch), the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
+    else if (nb_layers == 1 && (layout == 0 || layout == 1 || layout == 8))
+        param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+    /* When num_layers > 1, the type PARAMETER_DEFINITION_RECON_GAIN SHALL be present */
+    if (nb_layers > 1)
+        param_definition_types |= AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN;
+    /* When codec_id = fLaC or ipcm, the type PARAMETER_DEFINITION_RECON_GAIN SHALL NOT be present. */
+    if (codec_config->codec_tag == MKTAG('f','L','a','C') ||
+        codec_config->codec_tag == MKTAG('i','p','c','m'))
+        param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN;
+    if ((param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING) && !element->demixing_info) {
+        if (nb_layers > 1) {
+            ret = get_loudspeaker_layout(element->layers[nb_layers-1], &layout,
+                                         &expanded_layout, log_ctx);
+            if (ret < 0)
+                return ret;
+
+            /* When the highest loudspeaker_layout of the scalable channel audio (i.e., num_layers > 1) is greater than 3.1.2ch,
+             * (i.e., 5.1.2ch, 5.1.4ch, 7.1.2ch, or 7.1.4ch), type PARAMETER_DEFINITION_DEMIXING SHALL be present. */
+            if (layout == 3 || layout == 4 || layout == 6 || layout == 7) {
+                av_log(log_ctx, AV_LOG_ERROR, "demixing_info needed but not set in Stream Group #%u\n",
+                       audio_element->audio_element_id);
+                return AVERROR(EINVAL);
+            }
+        }
+        param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+    }
+    /* The recon gain definition the descriptor declares is serialized out of the Audio
+     * Element, so declaring the type without carrying one describes nothing. */
+    if ((param_definition_types & AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN) &&
+        !element->recon_gain_info) {
+        av_log(log_ctx, AV_LOG_ERROR, "recon_gain_info needed but not set in Stream Group #%u\n",
+               audio_element->audio_element_id);
+        return AVERROR(EINVAL);
+    }
+
+    *types = param_definition_types;
+
+    return 0;
+}
+
 static int iamf_write_audio_element(const IAMFContext *iamf,
                                     const IAMFAudioElement *audio_element,
                                     AVIOContext *pb, void *log_ctx)
 {
     const AVIAMFAudioElement *element = audio_element->celement;
-    const IAMFCodecConfig *codec_config = iamf->codec_configs[audio_element->codec_config_id];
     uint8_t header[MAX_IAMF_OBU_HEADER_SIZE];
     AVIOContext *dyn_bc;
     uint8_t *dyn_buf = NULL;
     PutBitContext pbc;
-    int param_definition_types = AV_IAMF_PARAMETER_DEFINITION_DEMIXING, dyn_size;
+    int param_definition_types, dyn_size;
 
-    int ret = avio_open_dyn_buf(&dyn_bc);
+    /* Decided before anything is written, and again by validate_audio_element() before any
+     * descriptor at all was, so this cannot be the first thing to refuse the element. */
+    int ret = get_param_definition_types(iamf, audio_element, &param_definition_types, log_ctx);
+    if (ret < 0)
+        return ret;
+
+    ret = avio_open_dyn_buf(&dyn_bc);
     if (ret < 0)
         return ret;
 
@@ -899,64 +1224,6 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
     for (int i = 0; i < audio_element->nb_substreams; i++)
         ffio_write_leb(dyn_bc, audio_element->substreams[i].audio_substream_id);
 
-    /* When audio_element_type = 1, num_parameters SHALL be set to 0 */
-    if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE)
-        param_definition_types = 0;
-    else {
-        int layout = 0, expanded_layout = 0;
-        /* Every decision below describes the layers scalable_channel_layout_config() is
-         * about to serialize, so it has to read the same validated layer count that
-         * function does rather than the one in the AVIAMFAudioElement, which the caller
-         * may have grown since this element was added. */
-        const unsigned nb_layers = FFMIN(audio_element->nb_layers, MAX_IAMF_LAYERS);
-
-        ret = get_loudspeaker_layout(element->layers[0], &layout, &expanded_layout, log_ctx);
-        if (ret < 0)
-            goto fail;
-
-        /* When the loudspeaker_layout = 15, the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
-        if (layout == 15) {
-            param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
-            /* expanded_loudspeaker_layout SHALL only be present when num_layers = 1 and loudspeaker_layout is set to 15 */
-            if (nb_layers > 1) {
-                av_log(log_ctx, AV_LOG_ERROR, "expanded_loudspeaker_layout present when using more than one layer in "
-                                              "Stream Group #%u\n",
-                       audio_element->audio_element_id);
-                ret = AVERROR(EINVAL);
-                goto fail;
-            }
-        }
-        /* When the loudspeaker_layout of the (non-)scalable channel audio (i.e., num_layers = 1) is less than or equal to 3.1.2ch,
-         * (i.e., Mono, Stereo, or 3.1.2ch), the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
-        else if (nb_layers == 1 && (layout == 0 || layout == 1 || layout == 8))
-            param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
-        /* When num_layers > 1, the type PARAMETER_DEFINITION_RECON_GAIN SHALL be present */
-        if (nb_layers > 1)
-            param_definition_types |= AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN;
-        /* When codec_id = fLaC or ipcm, the type PARAMETER_DEFINITION_RECON_GAIN SHALL NOT be present. */
-        if (codec_config->codec_tag == MKTAG('f','L','a','C') ||
-            codec_config->codec_tag == MKTAG('i','p','c','m'))
-            param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN;
-        if ((param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING) && !element->demixing_info) {
-            if (nb_layers > 1) {
-                ret = get_loudspeaker_layout(element->layers[nb_layers-1], &layout,
-                                             &expanded_layout, log_ctx);
-                if (ret < 0)
-                    goto fail;
-
-                /* When the highest loudspeaker_layout of the scalable channel audio (i.e., num_layers > 1) is greater than 3.1.2ch,
-                 * (i.e., 5.1.2ch, 5.1.4ch, 7.1.2ch, or 7.1.4ch), type PARAMETER_DEFINITION_DEMIXING SHALL be present. */
-                if (layout == 3 || layout == 4 || layout == 6 || layout == 7) {
-                    av_log(log_ctx, AV_LOG_ERROR, "demixing_info needed but not set in Stream Group #%u\n",
-                           audio_element->audio_element_id);
-                    ret = AVERROR(EINVAL);
-                    goto fail;
-                }
-            }
-            param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
-        }
-    }
-
     ffio_write_leb(dyn_bc, av_popcount(param_definition_types)); // num_parameters
 
     if (param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING) {
@@ -968,6 +1235,14 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
         ffio_write_leb(dyn_bc, AV_IAMF_PARAMETER_DEFINITION_DEMIXING); // type
 
         param_def = ff_iamf_get_param_definition(iamf, param->parameter_id);
+        /* This role is written out of whatever is registered under the id it names, so that
+         * definition has to be of the type just written above it. */
+        ret = check_param_definition_type(param, param_def,
+                                          AV_IAMF_PARAMETER_DEFINITION_DEMIXING,
+                                          "demixing_info", log_ctx);
+        if (ret < 0)
+            goto fail;
+
         ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
         if (ret < 0)
             goto fail;
@@ -979,6 +1254,8 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
         const AVIAMFParamDefinition *param = element->recon_gain_info;
         const IAMFParamDefinition *param_def;
 
+        /* get_param_definition_types() only declares this type for an element carrying one,
+         * so this cannot be reached; kept because the pointer is dereferenced below. */
         if (!param) {
             av_log(log_ctx, AV_LOG_ERROR, "recon_gain_info needed but not set in Stream Group #%u\n",
                    audio_element->audio_element_id);
@@ -988,6 +1265,12 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
         ffio_write_leb(dyn_bc, AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN); // type
 
         param_def = ff_iamf_get_param_definition(iamf, param->parameter_id);
+        ret = check_param_definition_type(param, param_def,
+                                          AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
+                                          "recon_gain_info", log_ctx);
+        if (ret < 0)
+            goto fail;
+
         ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
         if (ret < 0)
             goto fail;
@@ -998,7 +1281,7 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
         if (ret < 0)
             goto fail;
     } else {
-        ret = ambisonics_config(audio_element, dyn_bc);
+        ret = ambisonics_config(audio_element, dyn_bc, log_ctx);
         if (ret < 0)
             goto fail;
     }
@@ -1105,6 +1388,16 @@ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
             ffio_write_leb(dyn_bc, 0); // rendering_config_extension_size
 
             param_def = ff_iamf_get_param_definition(iamf, submix_element->element_mix_config->parameter_id);
+            /* A submix mix gain slot is always written, out of whatever is registered under
+             * the id it names, so that definition has to be a mix gain one. Checked before
+             * the Mix Presentations are serialized as well; kept here so no definition of
+             * another kind can fill this slot whatever reaches it. */
+            ret = check_param_definition_type(submix_element->element_mix_config, param_def,
+                                              AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                              "element_mix_config", log_ctx);
+            if (ret < 0)
+                goto fail;
+
             ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
             if (ret < 0)
                 goto fail;
@@ -1113,6 +1406,12 @@ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
         }
 
         param_def = ff_iamf_get_param_definition(iamf, sub_mix->output_mix_config->parameter_id);
+        ret = check_param_definition_type(sub_mix->output_mix_config, param_def,
+                                          AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                          "output_mix_config", log_ctx);
+        if (ret < 0)
+            goto fail;
+
         ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
         if (ret < 0)
             goto fail;
@@ -1225,6 +1524,7 @@ static int validate_audio_element(const IAMFContext *iamf,
                                   void *log_ctx)
 {
     const AVIAMFAudioElement *element = audio_element->celement;
+    int param_definition_types, ret;
 
     /* Both the num_layers field and the amount of layer records serialized come from the
      * count recorded when this element was added, as does the extent of everything indexed
@@ -1294,15 +1594,19 @@ static int validate_audio_element(const IAMFContext *iamf,
                    audio_element->audio_element_id);
             return AVERROR(EINVAL);
         }
-        if (layer->ambisonics_mode > AV_IAMF_AMBISONICS_MODE_PROJECTION) {
-            av_log(log_ctx, AV_LOG_ERROR, "Unsupported ambisonics mode %d in Audio Element id %u\n",
-                   layer->ambisonics_mode, audio_element->audio_element_id);
-            return AVERROR_PATCHWELCOME;
-        }
+
+        /* Everything else ambisonics_config() reads through the layer: the mode, the
+         * channel and substream counts each field's width admits, a complete ambisonic
+         * order, the ACN indices a custom order map is written as, and the demixing matrix
+         * a projection mode indexes. Checked here so an Audio Element with no serialization
+         * produces a diagnostic and no output at all. */
+        ret = check_ambisonics_layer(audio_element, log_ctx);
+        if (ret < 0)
+            return ret;
     } else {
         for (int i = 0; i < audio_element->nb_layers; i++) {
             const AVIAMFLayer *layer = element->layers[i];
-            int layout, expanded_layout, ret;
+            int layout, expanded_layout;
 
             /* Refuses a layer neither loudspeaker layout table describes, and by requiring
              * the channel count to agree with the entry matched, one carrying more channels
@@ -1330,6 +1634,15 @@ static int validate_audio_element(const IAMFContext *iamf,
                 return AVERROR(EINVAL);
             }
 
+            /* Only serialized for a layer carrying output gain flags, which is the same
+             * condition scalable_channel_layout_config() writes it under, so a layer that
+             * never reaches the scaling is not constrained by it. */
+            if (layer->output_gain_flags) {
+                ret = check_rational(layer->output_gain, "output_gain", "Layer", i, log_ctx);
+                if (ret < 0)
+                    return ret;
+            }
+
             if (!i)
                 continue;
 
@@ -1349,35 +1662,65 @@ static int validate_audio_element(const IAMFContext *iamf,
         }
     }
 
+    /* Which parameter definition types the descriptor declares, so that an Audio Element
+     * needing demixing or recon gain information it does not carry is refused here, before
+     * ff_iamf_write_descriptors() has written anything, and not part way through its own
+     * descriptor. Also tells which of the roles below is serialized out of the definition
+     * registered under the parameter id it names. */
+    ret = get_param_definition_types(iamf, audio_element, &param_definition_types, log_ctx);
+    if (ret < 0)
+        return ret;
+
     /* Each is serialized through the definition registered under the parameter id it names,
      * out of the single subblock it carries. */
     if (element->demixing_info) {
         const AVIAMFParamDefinition *param = element->demixing_info;
+        const IAMFParamDefinition *param_definition;
 
         if (param->nb_subblocks != 1) {
             av_log(log_ctx, AV_LOG_ERROR, "nb_subblocks in demixing_info of Audio Element id %u is not 1\n",
                    audio_element->audio_element_id);
             return AVERROR(EINVAL);
         }
-        if (!ff_iamf_get_param_definition(iamf, param->parameter_id)) {
+        param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+        if (!param_definition) {
             av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u in demixing_info of "
                    "Audio Element id %u\n", param->parameter_id, audio_element->audio_element_id);
             return AVERROR(EINVAL);
         }
+        /* The registered definition is only what this role is serialized out of when the
+         * descriptor declares the type; an id shared with a role it does not declare is not
+         * a conflict, and the CLI allocates both roles for every audio element it is given. */
+        ret = check_param_definition_type(param,
+                                          param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING
+                                          ? param_definition : NULL,
+                                          AV_IAMF_PARAMETER_DEFINITION_DEMIXING,
+                                          "demixing_info", log_ctx);
+        if (ret < 0)
+            return ret;
     }
     if (element->recon_gain_info) {
         const AVIAMFParamDefinition *param = element->recon_gain_info;
+        const IAMFParamDefinition *param_definition;
 
         if (param->nb_subblocks != 1) {
             av_log(log_ctx, AV_LOG_ERROR, "nb_subblocks in recon_gain_info of Audio Element id %u is not 1\n",
                    audio_element->audio_element_id);
             return AVERROR(EINVAL);
         }
-        if (!ff_iamf_get_param_definition(iamf, param->parameter_id)) {
+        param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+        if (!param_definition) {
             av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u in recon_gain_info of "
                    "Audio Element id %u\n", param->parameter_id, audio_element->audio_element_id);
             return AVERROR(EINVAL);
         }
+        ret = check_param_definition_type(param,
+                                          param_definition_types & AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN
+                                          ? param_definition : NULL,
+                                          AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
+                                          "recon_gain_info", log_ctx);
+        if (ret < 0)
+            return ret;
     }
 
     return 0;
@@ -1435,9 +1778,16 @@ static int validate_mix_presentation(const IAMFContext *iamf,
 {
     const AVIAMFMixPresentation *mix = mix_presentation->cmix;
     const int nb_labels = av_dict_count(mix->annotations);
+    const IAMFParamDefinition *param_definition;
+    int ret;
 
     for (int i = 0; i < mix->nb_submixes; i++) {
         const AVIAMFSubmix *submix = mix->submixes[i];
+
+        /* Scaled into the submix's signed fixed point default_mix_gain field. */
+        ret = check_rational(submix->default_mix_gain, "default_mix_gain", "Submix", i, log_ctx);
+        if (ret < 0)
+            return ret;
 
         /* The submix is serialized out of its output mix configuration, through the
          * definition registered under the parameter id it names. Same presence
@@ -1447,17 +1797,31 @@ static int validate_mix_presentation(const IAMFContext *iamf,
                    "Mix Presentation id #%u\n", i, mix_presentation->mix_presentation_id);
             return AVERROR(EINVAL);
         }
-        if (!ff_iamf_get_param_definition(iamf, submix->output_mix_config->parameter_id)) {
+        param_definition = ff_iamf_get_param_definition(iamf, submix->output_mix_config->parameter_id);
+        if (!param_definition) {
             av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u in output_mix_config "
                    "of submix %d from Mix Presentation id #%u\n",
                    submix->output_mix_config->parameter_id, i,
                    mix_presentation->mix_presentation_id);
             return AVERROR(EINVAL);
         }
+        /* The role mandates the type, of the definition it carries and of the one actually
+         * registered under that id, which need not be the same object. */
+        ret = check_param_definition_type(submix->output_mix_config, param_definition,
+                                          AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                          "output_mix_config", log_ctx);
+        if (ret < 0)
+            return ret;
 
         for (int j = 0; j < submix->nb_elements; j++) {
             const AVIAMFSubmixElement *element = submix->elements[j];
             const AVDictionaryEntry *tag = NULL;
+
+            /* Scaled into the element's signed fixed point default_mix_gain field. */
+            ret = check_rational(element->default_mix_gain, "default_mix_gain",
+                                 "Submix element", j, log_ctx);
+            if (ret < 0)
+                return ret;
 
             if (!find_audio_element(iamf, element->audio_element_id)) {
                 av_log(log_ctx, AV_LOG_ERROR, "Invalid Audio Element id %u referenced by element %d "
@@ -1472,13 +1836,19 @@ static int validate_mix_presentation(const IAMFContext *iamf,
                        j, i, mix_presentation->mix_presentation_id);
                 return AVERROR(EINVAL);
             }
-            if (!ff_iamf_get_param_definition(iamf, element->element_mix_config->parameter_id)) {
+            param_definition = ff_iamf_get_param_definition(iamf, element->element_mix_config->parameter_id);
+            if (!param_definition) {
                 av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u in "
                        "element_mix_config of element %d in submix %d from Mix Presentation id #%u\n",
                        element->element_mix_config->parameter_id, j, i,
                        mix_presentation->mix_presentation_id);
                 return AVERROR(EINVAL);
             }
+            ret = check_param_definition_type(element->element_mix_config, param_definition,
+                                              AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                                              "element_mix_config", log_ctx);
+            if (ret < 0)
+                return ret;
 
             /* The element's labels are serialized one per label the Mix Presentation
              * declares, in the order the Mix Presentation declares them, so it needs one
@@ -1514,6 +1884,39 @@ static int validate_mix_presentation(const IAMFContext *iamf,
 
         for (int j = 0; j < submix->nb_layouts; j++) {
             const AVIAMFSubmixLayout *submix_layout = submix->layouts[j];
+
+            /* integrated_loudness and digital_peak are always scaled into the layout's
+             * loudness information; the three below are only serialized when both their
+             * numerator and denominator are non-zero, a condition a negative denominator
+             * satisfies, so each is checked under that same gate. */
+            ret = check_rational(submix_layout->integrated_loudness, "integrated_loudness",
+                                 "Submix layout", j, log_ctx);
+            if (ret < 0)
+                return ret;
+            ret = check_rational(submix_layout->digital_peak, "digital_peak",
+                                 "Submix layout", j, log_ctx);
+            if (ret < 0)
+                return ret;
+            if (submix_layout->true_peak.num && submix_layout->true_peak.den) {
+                ret = check_rational(submix_layout->true_peak, "true_peak",
+                                     "Submix layout", j, log_ctx);
+                if (ret < 0)
+                    return ret;
+            }
+            if (submix_layout->dialogue_anchored_loudness.num &&
+                submix_layout->dialogue_anchored_loudness.den) {
+                ret = check_rational(submix_layout->dialogue_anchored_loudness,
+                                     "dialogue_anchored_loudness", "Submix layout", j, log_ctx);
+                if (ret < 0)
+                    return ret;
+            }
+            if (submix_layout->album_anchored_loudness.num &&
+                submix_layout->album_anchored_loudness.den) {
+                ret = check_rational(submix_layout->album_anchored_loudness,
+                                     "album_anchored_loudness", "Submix layout", j, log_ctx);
+                if (ret < 0)
+                    return ret;
+            }
 
             /* A loudspeakers layout is serialized as the sound_system describing its
              * channel layout, and no other layout type has a serialization at all. */
@@ -1604,8 +2007,22 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
     uint8_t *dyn_buf = NULL;
     int dyn_size, ret;
 
-    if (param->type > AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN) {
-        av_log(log_ctx, AV_LOG_DEBUG, "Ignoring side data with unknown type %u\n",
+    /* This structure is the packet's side data read in place, so the type field holds
+     * whatever bytes the caller put there and not only the values the enumeration names.
+     * Enumerated rather than bounded from above, because the type an enumeration is
+     * represented as is implementation defined: unsigned here, where every value an upper
+     * bound admits is one of the three below, but a signed choice is just as conforming and
+     * there a value under the first enumerator would pass that bound and then match no case
+     * of the switch serializing the subblocks, reaching its av_unreachable. Listing the
+     * types that switch handles keeps its default unreachable however the enumeration is
+     * represented, rather than by a property of this compiler. */
+    switch (param->type) {
+    case AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN:
+    case AV_IAMF_PARAMETER_DEFINITION_DEMIXING:
+    case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+        break;
+    default:
+        av_log(log_ctx, AV_LOG_DEBUG, "Ignoring side data with unknown type %d\n",
                param->type);
         return 0;
     }
@@ -1623,16 +2040,20 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
         return AVERROR(EINVAL);
     }
 
+    /* A recon gain block is serialized per layer of the Audio Element its definition
+     * belongs to, and a definition registered from a Mix Presentation belongs to none.
+     * Refused here rather than where it is read, so a packet that cannot be serialized
+     * contributes nothing at all instead of an OBU header with no body behind it. */
+    if (param->type == AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN &&
+        !param_definition->audio_element) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u referenced by a packet\n",
+               param->parameter_id);
+        return AVERROR(EINVAL);
+    }
+
     ret = avio_open_dyn_buf(&dyn_bc);
     if (ret < 0)
         return ret;
-
-    // Sequence Header
-    init_put_bits(&pbc, header, sizeof(header));
-    put_bits(&pbc, 5, IAMF_OBU_IA_PARAMETER_BLOCK);
-    put_bits(&pbc, 3, 0);
-    flush_put_bits(&pbc);
-    avio_write(pb, header, put_bytes_count(&pbc, 1));
 
     ffio_write_leb(dyn_bc, param->parameter_id);
     if (!param_definition->mode) {
@@ -1648,6 +2069,33 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
         switch (param->type) {
         case AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN: {
             const AVIAMFMixGain *mix = subblock;
+
+            /* Every rational this subblock serializes is checked before the first one is
+             * written, so a subblock carrying one that cannot be scaled leaves no partial
+             * animation behind. The ones after the first are only written for the
+             * animation types that carry them, and only those are constrained. */
+            ret = check_rational(mix->start_point_value, "start_point_value",
+                                 "Mix gain subblock", i, log_ctx);
+            if (ret < 0)
+                goto fail;
+            if (mix->animation_type >= AV_IAMF_ANIMATION_TYPE_LINEAR) {
+                ret = check_rational(mix->end_point_value, "end_point_value",
+                                     "Mix gain subblock", i, log_ctx);
+                if (ret < 0)
+                    goto fail;
+            }
+            if (mix->animation_type == AV_IAMF_ANIMATION_TYPE_BEZIER) {
+                ret = check_rational(mix->control_point_value, "control_point_value",
+                                     "Mix gain subblock", i, log_ctx);
+                if (ret < 0)
+                    goto fail;
+                ret = check_rational(mix->control_point_relative_time,
+                                     "control_point_relative_time",
+                                     "Mix gain subblock", i, log_ctx);
+                if (ret < 0)
+                    goto fail;
+            }
+
             if (!param_definition->mode && param->constant_subblock_duration == 0)
                 ffio_write_leb(dyn_bc, mix->subblock_duration);
 
@@ -1678,9 +2126,8 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
             if (!param_definition->mode && param->constant_subblock_duration == 0)
                 ffio_write_leb(dyn_bc, recon->subblock_duration);
 
-            /* A recon gain definition belongs to an Audio Element, but one registered
-             * from a Mix Presentation carries no Audio Element at all, so this is checked
-             * before anything is read through it. */
+            /* Refused before this OBU was opened, so this cannot be reached; kept because
+             * the Audio Element is dereferenced below. */
             if (!audio_element) {
                 av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u referenced by a packet\n", param->parameter_id);
                 ret = AVERROR(EINVAL);
@@ -1724,7 +2171,17 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
         }
     }
 
+    /* Written only now that the whole body has been serialized. Emitting it up front would
+     * leave an OBU header on the output with nothing behind it for any subblock refused
+     * above, and a header announcing a parameter block that is not there is not something a
+     * reader can skip. The bytes reach pb in the same order either way. */
+    init_put_bits(&pbc, header, sizeof(header));
+    put_bits(&pbc, 5, IAMF_OBU_IA_PARAMETER_BLOCK);
+    put_bits(&pbc, 3, 0);
+    flush_put_bits(&pbc);
+
     dyn_size = avio_get_dyn_buf(dyn_bc, &dyn_buf);
+    avio_write(pb, header, put_bytes_count(&pbc, 1));
     ffio_write_leb(pb, dyn_size);
     avio_write(pb, dyn_buf, dyn_size);
     ret = 0;

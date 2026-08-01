@@ -248,6 +248,56 @@ static const AVChannelLayout ambisonic_layout =
     AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER;
 
 /**
+ * Channel counts a SCENE_BASED element's layer may declare. An Ambisonics
+ * layout carries a complete order, so its channel count is a perfect square;
+ * the entries that are not are here so the completeness check has input
+ * reaching it, which nothing else in this target produces. Kept small because a
+ * scene element's substreams are mono, so each channel costs one stream.
+ */
+static const uint8_t scene_channels[4] = { 4, 1, 9, 3 };
+
+/**
+ * How a SCENE_BASED element's layer is built, from one control byte.
+ *
+ * The projection forms come last and are tested for as a group, so anything
+ * added has to go before SCENE_PROJECTION or it is taken for one of them.
+ */
+enum SceneMode {
+    SCENE_AMBISONIC,        /**< native order, mono mode: the ordinary form   */
+    SCENE_CUSTOM_ACN,       /**< custom order carrying ACN relative ids       */
+    SCENE_CUSTOM_FOREIGN,   /**< custom order carrying ids that are not ACN   */
+    SCENE_CUSTOM_WIDE,      /**< an ACN index past the byte it is written to  */
+    SCENE_BAD_MODE,         /**< an ambisonics mode outside the enumeration   */
+    SCENE_PROJECTION,       /**< projection mode with a matrix that fits      */
+    SCENE_PROJECTION_NULL,  /**< a matrix declared and not allocated          */
+    SCENE_PROJECTION_SHORT, /**< a matrix of the wrong cardinality            */
+    SCENE_NB
+};
+
+/** Which caller supplied rational is made impossible to scale, if any. */
+enum BadRational {
+    BAD_RATIONAL_NONE,
+    BAD_RATIONAL_OUTPUT_GAIN,       /**< a layer's output gain               */
+    BAD_RATIONAL_SUBMIX_GAIN,       /**< a submix's default mix gain         */
+    BAD_RATIONAL_ELEMENT_GAIN,      /**< a submix element's default mix gain */
+    BAD_RATIONAL_INTEGRATED,        /**< a layout's integrated loudness      */
+    BAD_RATIONAL_TRUE_PEAK,         /**< a layout's true peak, a gated field */
+    BAD_RATIONAL_MIX_SUBBLOCK,      /**< a mix gain subblock's start point   */
+    BAD_RATIONAL_MATRIX,            /**< a projection matrix entry           */
+    BAD_RATIONAL_NB
+};
+
+/** Which enumerated field is given a value outside its enumeration, if any. */
+enum BadEnum {
+    BAD_ENUM_NONE,
+    BAD_ENUM_ELEMENT_TYPE,      /**< audio_element_type                 */
+    BAD_ENUM_HEADPHONES,        /**< headphones_rendering_mode          */
+    BAD_ENUM_LAYOUT_TYPE,       /**< a submix layout's layout_type      */
+    BAD_ENUM_SIDE_DATA_TYPE,    /**< a parameter block's type field     */
+    BAD_ENUM_NB
+};
+
+/**
  * Channel layouts a substream may be given, indexed by channel count.
  *
  * A substream carries one channel or a coupled pair, so the entries at 0 and 3
@@ -272,7 +322,7 @@ static const int sample_rates[4] = { 48000, 44100, 16000, 96000 };
  * space fits in this one flat block, so no input has to be longer to reach any
  * part of it, and a shorter one reaches the block's leading knobs.
  */
-#define CONTROL_BLOCK_SIZE 31
+#define CONTROL_BLOCK_SIZE 38
 
 /** A muxing scenario: fuzz-derived controls, each with a default. */
 typedef struct FuzzConfig {
@@ -312,6 +362,13 @@ typedef struct FuzzConfig {
     int mutate_layer;       /**< how an already validated layer is replaced */
     unsigned grow_mix;      /**< what is appended to an already validated mix */
     uint8_t recon_seed[8];  /**< expanded into the recon gain matrix */
+    int scene_mode;         /**< enum SceneMode: how a scene layer is built */
+    int scene_channels;     /**< index into scene_channels */
+    int bad_rational;       /**< enum BadRational */
+    int bad_enum;           /**< enum BadEnum */
+    int output_gain;        /**< a layer's output gain numerator, signed */
+    int omit_mandatory;     /**< withhold the definitions a descriptor needs */
+    int same_param_id;      /**< give every role one parameter id */
 } FuzzConfig;
 
 static void config_defaults(FuzzConfig *cfg)
@@ -342,8 +399,14 @@ static void config_defaults(FuzzConfig *cfg)
     cfg->mix_id            = 100;
     cfg->demix_id          = 998;
     cfg->recon_id          = 101;
-    cfg->io_buffer_size    = 32768;
+    /* Small enough that a partial OBU written before a rejection is flushed
+     * rather than discarded unwritten with the context, which is what makes a
+     * stray byte reach the sink at all. */
+    cfg->io_buffer_size    = 64;
     cfg->max_pkt_size      = 1024;
+    /* A gain of minus one, a legitimate negative that has to be accepted and
+     * that no other control in this target produces. */
+    cfg->output_gain       = -256;
 
     for (int i = 0; i < (int)FF_ARRAY_ELEMS(cfg->recon_seed); i++)
         cfg->recon_seed[i] = i & 1 ? 0 : 1 + i * 31;
@@ -454,7 +517,9 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     if (!config_byte(gbc, &v))
         return;
 
-    cfg->output_gain_flags  = v & 0x3F;
+    /* The whole byte, so values past six bits reach the width the flags are
+     * serialized in; masking them away left that check with no input. */
+    cfg->output_gain_flags  = v;
 
     if (!config_byte(gbc, &v))
         return;
@@ -538,11 +603,71 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
      * them is something ff_iamf_add_mix_presentation() would have refused or
      * registered had it been there, so none of them can be serialized. */
     cfg->grow_mix           = v & 7;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* Which of the Ambisonics forms the scene element's layer takes: a native
+     * order layout, a custom order one carrying ACN indices or ids that are not
+     * ACN at all or an index past the byte it goes in, and projection mode with
+     * a matrix that fits, none at all, or one of the wrong size. */
+    cfg->scene_mode         = v % SCENE_NB;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    cfg->scene_channels     = v % FF_ARRAY_ELEMS(scene_channels);
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* One rational the writer scales into a fixed point field, given a
+     * denominator it cannot be scaled by. Each selects a different sink, and
+     * between them they cover every field that reaches the scaling. */
+    cfg->bad_rational       = v % BAD_RATIONAL_NB;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* One enumerated field given a value the enumeration does not name. Each is
+     * either serialized into a field of its own width or selects the serializer
+     * to use, so none of them has anything to write for such a value. */
+    cfg->bad_enum           = v % BAD_ENUM_NB;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* Signed, and over the range the field holds and a little past it: the
+     * gain is scaled by 256 into sixteen signed bits, so a numerator beyond
+     * 128 in either direction has no field to go in. */
+    cfg->output_gain        = ((int)v - 128) * 256;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* Withhold the definitions the descriptor needs. Without this the roles are
+     * forced on for every element of more than one layer, leaving the checks
+     * for a declared definition that is not carried with no input. */
+    cfg->omit_mandatory     = v & 1;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* One parameter id for every role, so a descriptor resolves a role against
+     * a definition registered for another. The ids are a byte each and collide
+     * by chance already; this makes it happen on purpose. */
+    cfg->same_param_id      = v & 1;
 }
 
 static int element_nb_layers(const FuzzConfig *cfg)
 {
     return cfg->scene_element ? cfg->scene_layers : cfg->nb_layers;
+}
+
+/** Channels a SCENE_BASED element's layer declares. */
+static int scene_nb_channels(const FuzzConfig *cfg)
+{
+    return scene_channels[cfg->scene_channels];
 }
 
 /** The layout of layer @p idx; past a chain's length the last one repeats. */
@@ -574,6 +699,38 @@ static int set_layer_layout(AVChannelLayout *dst, const FuzzConfig *cfg,
 {
     int ret;
 
+    if (cfg->scene_element) {
+        const int nb_channels = scene_nb_channels(cfg);
+
+        /* A native order Ambisonics layout only exists for a complete order, so
+         * anything else has to be described as a custom order map. */
+        if (cfg->scene_mode == SCENE_AMBISONIC && nb_channels == 4)
+            return av_channel_layout_copy(dst, &ambisonic_layout);
+
+        if (cfg->scene_mode >= SCENE_PROJECTION) {
+            /* Projection mode carries no map: the layout is the channel count
+             * and the matrix describes how the substreams reach it. */
+            dst->order       = AV_CHANNEL_ORDER_AMBISONIC;
+            dst->nb_channels = nb_channels;
+
+            return 0;
+        }
+
+        ret = av_channel_layout_custom_init(dst, nb_channels);
+        if (ret < 0)
+            return ret;
+
+        for (int i = 0; i < nb_channels; i++)
+            dst->u.map[i].id =
+                cfg->scene_mode == SCENE_CUSTOM_FOREIGN ?
+                    AV_CHAN_FRONT_LEFT + i :
+                cfg->scene_mode == SCENE_CUSTOM_WIDE ?
+                    AV_CHAN_AMBISONIC_BASE + 256 + i :
+                    AV_CHAN_AMBISONIC_BASE + i;
+
+        return 0;
+    }
+
     if (!cfg->custom_layers)
         return av_channel_layout_copy(dst, layer_layout(cfg, idx, nb_layers));
 
@@ -589,6 +746,9 @@ static int set_layer_layout(AVChannelLayout *dst, const FuzzConfig *cfg,
 
 static int layer_nb_channels(const FuzzConfig *cfg, int idx, int nb_layers)
 {
+    if (cfg->scene_element)
+        return scene_nb_channels(cfg);
+
     if (cfg->custom_layers)
         return 2 + idx;
 
@@ -636,6 +796,48 @@ static int plan_substreams(const FuzzConfig *cfg, int nb_layers,
 }
 
 /**
+ * The parameter id an audio element's role names, for element @p index.
+ *
+ * A definition is resolved by parameter id alone, so an id shared between roles
+ * of different types leaves whichever was registered under it first as what the
+ * others are serialized out of. The ids come from the control block a byte
+ * apiece and so collide by themselves; same_param_id forces the collision so it
+ * is reached without waiting for one.
+ */
+static unsigned param_id(const FuzzConfig *cfg, unsigned id, int index)
+{
+    return cfg->same_param_id ? cfg->mix_id : id + index;
+}
+
+/**
+ * Whether an audio element registers a definition under the parameter id the
+ * mix presentation's mix gain roles name.
+ *
+ * The audio elements are added first, so a definition of theirs is what a mix
+ * gain role resolves to whenever the ids meet, and a mix gain role serialized
+ * out of a demixing or recon gain definition writes a type ahead of one that
+ * was never of it. Which of the two roles an element carries is the same
+ * condition add_audio_element() creates them under.
+ */
+static int mix_id_taken_by_element(const FuzzConfig *cfg)
+{
+    const int nb_layers = element_nb_layers(cfg);
+    const int has_demix = !cfg->omit_mandatory &&
+                          (cfg->with_demix_info || nb_layers > 1);
+    const int has_recon = !cfg->omit_mandatory &&
+                          (cfg->with_recon_info || nb_layers > 1);
+
+    for (int i = 0; i < cfg->nb_elements; i++) {
+        if (has_demix && param_id(cfg, cfg->demix_id, i) == cfg->mix_id)
+            return 1;
+        if (has_recon && param_id(cfg, cfg->recon_id, i) == cfg->mix_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+/**
  * Why the muxer cannot accept @p cfg, or NULL if it may.
  *
  * Only invariants the writer is required to enforce are listed, and only for
@@ -643,6 +845,13 @@ static int plan_substreams(const FuzzConfig *cfg, int nb_layers,
  * finding when such a configuration is accepted. Erring towards NULL is the
  * safe direction: a configuration called muxable here is not claimed to be
  * valid, only not provably invalid, and being refused is always ordinary.
+ *
+ * Only what the descriptors are written from is judged, because the caller
+ * measures this against the header having been written. A control reaching the
+ * writer through a packet's side data instead is left out however certainly it
+ * is refused there: the header is right to succeed for it, and listing it would
+ * report every such input. Those controls are judged by the run not aborting,
+ * which is what the checks they reach replaced.
  *
  * This is the half a sanitizer cannot supply. A guard that stops refusing an
  * invalid configuration does not fault; it serializes a descriptor violating
@@ -663,16 +872,98 @@ static const char *rejection_reason(const FuzzConfig *cfg)
     if (cfg->dangling_element)
         return "a submix referring to an audio element that is not present";
 
+    /* Every one of these is scaled into a fixed point field by a division whose
+     * divisor is the denominator, so none of them can be serialized. The one
+     * carried by a parameter block is left to the caller's other reading, being
+     * reached through a packet rather than through a descriptor. */
+    if (cfg->bad_rational != BAD_RATIONAL_NONE &&
+        cfg->bad_rational != BAD_RATIONAL_MIX_SUBBLOCK &&
+        /* Except the two that are only reached under a condition of their own:
+         * a layer's output gain only for a layer carrying flags, and a matrix
+         * entry only for a projection mode layer that has a matrix allocated to
+         * put one in. */
+        (cfg->bad_rational != BAD_RATIONAL_OUTPUT_GAIN ||
+         (!cfg->scene_element && cfg->output_gain_flags)) &&
+        (cfg->bad_rational != BAD_RATIONAL_MATRIX ||
+         (cfg->scene_element && cfg->scene_mode >= SCENE_PROJECTION &&
+          cfg->scene_mode != SCENE_PROJECTION_NULL)))
+        return "a rational with a denominator it cannot be scaled by";
+
+    /* Each of these is serialized into a field of its own width, or selects
+     * which serializer runs, and no value outside the enumeration has either.
+     * The parameter block's own type field is likewise left out, reaching the
+     * writer through a packet. */
+    if (cfg->bad_enum == BAD_ENUM_ELEMENT_TYPE)
+        return "an audio element type outside the enumeration";
+    if (cfg->bad_enum == BAD_ENUM_HEADPHONES)
+        return "a headphones rendering mode outside the enumeration";
+    if (cfg->bad_enum == BAD_ENUM_LAYOUT_TYPE)
+        return "a submix layout type outside the enumeration";
+
+    /* A mix gain role is always serialized, and out of whichever definition was
+     * registered under the id it names, which an audio element got to first. */
+    if (mix_id_taken_by_element(cfg))
+        return "a mix gain role resolving to a definition of another type";
+
     if (cfg->scene_element) {
+        const int nb_channels = scene_nb_channels(cfg);
+
         /* A scene element describes one Ambisonics layout, so it has one layer,
          * and a count of none has no layer to describe it with. */
         if (nb_layers != 1)
             return "a scene based audio element with other than one layer";
+
+        /* An Ambisonics layout carries every harmonic of a complete order, so
+         * its channel count is a perfect square. */
+        if (nb_channels != 1 && nb_channels != 4 && nb_channels != 9)
+            return "an Ambisonics layout of an incomplete order";
+
+        switch (cfg->scene_mode) {
+        /* A custom order map is written as one ACN index per channel, in one
+         * byte each, so every id has to be ambisonic and within that byte. */
+        case SCENE_CUSTOM_FOREIGN:
+            return "a custom order map carrying ids that are not Ambisonics";
+        case SCENE_CUSTOM_WIDE:
+            return "an ACN index past the byte it is serialized into";
+        /* The matrix is read entry by entry for every channel of every
+         * substream, so a count short of that geometry, or none allocated at
+         * all, leaves the serializer nothing to write those entries from. */
+        case SCENE_PROJECTION_NULL:
+            return "a demixing matrix count with no matrix allocated";
+        case SCENE_PROJECTION_SHORT:
+            /* One channel squares to one entry, of which one less is none, and
+             * set_projection_matrix() declares one either way; that leaves the
+             * count agreeing with the geometry and nothing to object to. */
+            if (nb_channels > 1)
+                return "a demixing matrix shorter than its geometry";
+            break;
+        case SCENE_BAD_MODE:
+            return "an Ambisonics mode outside the enumeration";
+        default:
+            break;
+        }
     } else {
         /* The layer count bounds the loop indexing the recon gain matrix and is
          * written into a three bit field, so it has an upper bound. */
         if (nb_layers > MAX_LAYERS)
             return "more layers than the recon gain matrix has rows";
+
+        /* Serialized into a six bit field of its own, which is also the width
+         * the parser reads the flags back from. */
+        if (cfg->output_gain_flags > 0x3F)
+            return "output gain flags wider than the field they go in";
+
+        /*
+         * Past one layer the descriptor declares a recon gain definition, which
+         * it then serializes out of the audio element, so declaring the type
+         * without carrying one describes nothing. Only past one layer: a single
+         * layer element declares no recon gain, and the demixing type a single
+         * layer may declare is dropped rather than refused when uncarried. The
+         * codec here is Opus, which is neither of the two that would have the
+         * type cleared again.
+         */
+        if (cfg->omit_mandatory && nb_layers > 1)
+            return "a declared recon gain definition that is not carried";
 
         /* Every custom layer shares one channel mask while carrying a channel
          * count of its own, so from the second on no layout has both. */
@@ -737,6 +1028,47 @@ static AVIAMFParamDefinition *alloc_param(enum AVIAMFParamDefinitionType type,
 }
 
 /**
+ * Give a projection mode layer its demixing matrix.
+ *
+ * The cardinality the layer must declare is its substreams times its channels,
+ * which for a scene element's mono substreams is the channel count squared. The
+ * absent form declares that count and allocates nothing, and the short form
+ * declares one less than the geometry calls for; both are things the writer can
+ * see. The array is always exactly as long as the count declared, because an
+ * array shorter than its own count is not something any amount of validation
+ * can detect and reporting it would say nothing about the writer.
+ */
+static int set_projection_matrix(AVIAMFLayer *layer, const FuzzConfig *cfg)
+{
+    const int nb_channels = scene_nb_channels(cfg);
+    const int nb_entries  = nb_channels * nb_channels;
+    int nb_declared = nb_entries;
+
+    if (cfg->scene_mode == SCENE_PROJECTION_SHORT)
+        nb_declared = FFMAX(nb_entries - 1, 1);
+
+    layer->nb_demixing_matrix = nb_declared;
+
+    if (cfg->scene_mode == SCENE_PROJECTION_NULL)
+        return 0;
+
+    layer->demixing_matrix = av_malloc_array(nb_declared, sizeof(AVRational));
+    if (!layer->demixing_matrix)
+        return AVERROR(ENOMEM);
+
+    for (int i = 0; i < nb_declared; i++)
+        layer->demixing_matrix[i] = av_make_q(cfg->recon_seed[i & 7] - 128,
+                                              1 << 7);
+
+    /* The last entry is the one written last, so a denominator it cannot be
+     * scaled by is only reached once every entry before it already was. */
+    if (cfg->bad_rational == BAD_RATIONAL_MATRIX)
+        layer->demixing_matrix[nb_declared - 1] = av_make_q(1, 0);
+
+    return 0;
+}
+
+/**
  * Build one audio element stream group and its substreams. The group
  * pre-allocates its AVIAMFAudioElement, so it is filled in place and freed with
  * the format context.
@@ -760,6 +1092,10 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
     ae->audio_element_type = cfg->scene_element ?
                              AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE :
                              AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL;
+    /* Neither of the two types the enumeration names, so there is no field it
+     * fits in and no serializer for the layers it would select. */
+    if (cfg->bad_enum == BAD_ENUM_ELEMENT_TYPE)
+        ae->audio_element_type = (enum AVIAMFAudioElementType)3;
     ae->default_w = 10;
 
     for (int i = 0; i < nb_layers; i++) {
@@ -776,11 +1112,29 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
         if (cfg->recon_gain_layers & (1u << FFMIN(i, 31)))
             layer->flags |= AV_IAMF_LAYER_FLAG_RECON_GAIN;
         layer->output_gain_flags = cfg->output_gain_flags;
+        /* Only scaled for a layer carrying flags, so the flags decide whether
+         * this reaches the scaling at all. */
+        layer->output_gain = cfg->bad_rational == BAD_RATIONAL_OUTPUT_GAIN ?
+                             av_make_q(1, 0) : av_make_q(cfg->output_gain, 256);
+
+        /* Mono mode is the default and needs nothing set. Projection mode is
+         * the three forms from SCENE_PROJECTION on, each of which wants a
+         * matrix; the bad mode sorts before them so that it is not taken for
+         * one, its layer being otherwise ordinary. */
+        if (cfg->scene_element && cfg->scene_mode >= SCENE_PROJECTION) {
+            layer->ambisonics_mode = AV_IAMF_AMBISONICS_MODE_PROJECTION;
+            ret = set_projection_matrix(layer, cfg);
+            if (ret < 0)
+                return ret;
+        } else if (cfg->scene_element && cfg->scene_mode == SCENE_BAD_MODE) {
+            layer->ambisonics_mode = (enum AVIAMFAmbisonicsMode)3;
+        }
     }
 
     /* Recon gain is mandatory past one layer unless the codec is fLaC or ipcm,
-     * demixing only for the higher layouts; both are always given anyway. */
-    if (cfg->with_demix_info || nb_layers > 1) {
+     * demixing only for the higher layouts; both are otherwise always given, so
+     * omit_mandatory is what leaves a declared definition uncarried. */
+    if (!cfg->omit_mandatory && (cfg->with_demix_info || nb_layers > 1)) {
         AVIAMFParamDefinition *demix;
         AVIAMFDemixingInfo *info;
 
@@ -790,11 +1144,11 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
             return AVERROR(ENOMEM);
         ae->demixing_info = demix;
 
-        demix->parameter_id = cfg->demix_id + index;
+        demix->parameter_id = param_id(cfg, cfg->demix_id, index);
         info = av_iamf_param_definition_get_subblock(demix, 0);
         info->dmixp_mode = cfg->dmixp_mode;
     }
-    if (cfg->with_recon_info || nb_layers > 1) {
+    if (!cfg->omit_mandatory && (cfg->with_recon_info || nb_layers > 1)) {
         AVIAMFParamDefinition *recon;
 
         recon = alloc_param(AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN, 1);
@@ -802,7 +1156,7 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
             return AVERROR(ENOMEM);
         ae->recon_gain_info = recon;
 
-        recon->parameter_id = cfg->recon_id + index;
+        recon->parameter_id = param_id(cfg, cfg->recon_id, index);
     }
 
     nb_substreams = plan_substreams(cfg, nb_layers, substream_channels,
@@ -1142,6 +1496,8 @@ static int add_mix_presentation(AVFormatContext *oc, const FuzzConfig *cfg)
      * a rate from, so it must be set here or the presentation is refused. */
     submix->output_mix_config->parameter_id   = cfg->mix_id;
     submix->output_mix_config->parameter_rate = cfg->sample_rate;
+    if (cfg->bad_rational == BAD_RATIONAL_SUBMIX_GAIN)
+        submix->default_mix_gain = av_make_q(1, 0);
 
     for (int i = 0; i < cfg->nb_elements; i++) {
         AVIAMFSubmixElement *element = av_iamf_submix_add_element(submix);
@@ -1163,6 +1519,13 @@ static int add_mix_presentation(AVFormatContext *oc, const FuzzConfig *cfg)
         element->headphones_rendering_mode = cfg->binaural_rendering ?
                                              AV_IAMF_HEADPHONES_MODE_BINAURAL :
                                              AV_IAMF_HEADPHONES_MODE_STEREO;
+        /* Serialized into a two bit field that the enumeration's two values
+         * fill, so a third has nothing to be written as. */
+        if (cfg->bad_enum == BAD_ENUM_HEADPHONES)
+            element->headphones_rendering_mode =
+                (enum AVIAMFHeadphonesMode)2;
+        if (cfg->bad_rational == BAD_RATIONAL_ELEMENT_GAIN)
+            element->default_mix_gain = av_make_q(1, 0);
     }
 
     layout = av_iamf_submix_add_layout(submix);
@@ -1179,6 +1542,19 @@ static int add_mix_presentation(AVFormatContext *oc, const FuzzConfig *cfg)
         if (ret < 0)
             return ret;
     }
+
+    /* Serialized into a two bit field, and it selects whether a sound system is
+     * written at all, so a value naming neither layout has neither. */
+    if (cfg->bad_enum == BAD_ENUM_LAYOUT_TYPE)
+        layout->layout_type = (enum AVIAMFSubmixLayoutType)1;
+
+    /* Always scaled, so this always reaches it. */
+    if (cfg->bad_rational == BAD_RATIONAL_INTEGRATED)
+        layout->integrated_loudness = av_make_q(1, 0);
+    /* Only scaled when both parts are non zero, and a negative denominator
+     * satisfies that and then reaches the scaling anyway. */
+    if (cfg->bad_rational == BAD_RATIONAL_TRUE_PEAK)
+        layout->true_peak = av_make_q(3, -4);
 
     for (unsigned i = 0; i < oc->nb_streams; i++) {
         ret = avformat_stream_group_add_stream(stg, oc->streams[i]);
@@ -1211,6 +1587,9 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
     param->constant_subblock_duration = cfg->frame_size;
 
     for (int i = 0; i < cfg->nb_subblocks; i++) {
+        /* The subblocks are filled through the type they were allocated with,
+         * before the field is overwritten below, so each one is a whole valid
+         * subblock of a kind the type field then contradicts. */
         void *subblock = av_iamf_param_definition_get_subblock(param, i);
 
         switch (type) {
@@ -1224,6 +1603,10 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
             gain->control_point_value = av_make_q(cfg->recon_seed[2], 1 << 8);
             gain->control_point_relative_time = av_make_q(cfg->recon_seed[3],
                                                           1 << 8);
+            /* The first rational the subblock writes, so nothing of the
+             * animation is out when it is reached. */
+            if (cfg->bad_rational == BAD_RATIONAL_MIX_SUBBLOCK)
+                gain->start_point_value = av_make_q(1, 0);
             break;
         }
         case AV_IAMF_PARAMETER_DEFINITION_DEMIXING: {
@@ -1246,6 +1629,13 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
         }
         }
     }
+
+    /* Side data is read in place, so the type field holds whatever a caller put
+     * there. A value the enumeration does not name selects no subblock
+     * serializer, and this is the only way anything but the three named ones
+     * reaches the writer. */
+    if (cfg->bad_enum == BAD_ENUM_SIDE_DATA_TYPE)
+        param->type = (enum AVIAMFParamDefinitionType)(type + 8);
 
     return param;
 }

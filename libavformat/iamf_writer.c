@@ -2004,14 +2004,27 @@ int ff_iamf_write_descriptors(const IAMFContext *iamf, AVIOContext *pb, void *lo
 }
 
 static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
-                                 const AVIAMFParamDefinition *param, void *log_ctx)
+                                 const AVIAMFParamDefinition *param, size_t param_size,
+                                 void *log_ctx)
 {
     uint8_t header[MAX_IAMF_OBU_HEADER_SIZE];
-    const IAMFParamDefinition *param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+    const IAMFParamDefinition *param_definition;
     PutBitContext pbc;
     AVIOContext *dyn_bc;
     uint8_t *dyn_buf = NULL;
+    size_t min_subblock_size;
     int dyn_size, ret;
+
+    /* This structure is the packet's side data read in place, so the size that side data
+     * is carried with is the only bound on it, and a blob shorter than the structure has
+     * no field to read at all. Measured before the first one is read, the fields the
+     * subblock bound below is computed from included. */
+    if (param_size < sizeof(*param)) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition side data of %zu bytes "
+                                      "in a packet. Must be at least %zu\n",
+               param_size, sizeof(*param));
+        return AVERROR(EINVAL);
+    }
 
     /* This structure is the packet's side data read in place, so the type field holds
      * whatever bytes the caller put there and not only the values the enumeration names.
@@ -2021,11 +2034,17 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
      * there a value under the first enumerator would pass that bound and then match no case
      * of the switch serializing the subblocks, reaching its av_unreachable. Listing the
      * types that switch handles keeps its default unreachable however the enumeration is
-     * represented, rather than by a property of this compiler. */
+     * represented, rather than by a property of this compiler. Each case also gives the
+     * size of the subblock its type is read as, which the bound below measures against. */
     switch (param->type) {
     case AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN:
+        min_subblock_size = sizeof(AVIAMFMixGain);
+        break;
     case AV_IAMF_PARAMETER_DEFINITION_DEMIXING:
+        min_subblock_size = sizeof(AVIAMFDemixingInfo);
+        break;
     case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+        min_subblock_size = sizeof(AVIAMFReconGain);
         break;
     default:
         av_log(log_ctx, AV_LOG_DEBUG, "Ignoring side data with unknown type %d\n",
@@ -2033,6 +2052,23 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
         return 0;
     }
 
+    /* The subblocks are inside the same side data, at the offset and the stride it
+     * declares, and av_iamf_param_definition_get_subblock() computes a pointer from them
+     * without knowing where that side data ends. So every subblock the count announces
+     * has to fit in what the packet carries, and the stride has to hold a whole subblock
+     * of the type it is read as. Divided rather than multiplied, so the bound cannot
+     * overflow, and by a stride the comparison before it has already found non zero. */
+    if (param->subblocks_offset > param_size || param->subblock_size < min_subblock_size ||
+        param->nb_subblocks > (param_size - param->subblocks_offset) / param->subblock_size) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid Parameter Definition with ID %u in a packet: "
+                                      "%u subblocks of %zu bytes at offset %zu do not fit in "
+                                      "%zu bytes of side data\n",
+               param->parameter_id, param->nb_subblocks, param->subblock_size,
+               param->subblocks_offset, param_size);
+        return AVERROR(EINVAL);
+    }
+
+    param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
     if (!param_definition) {
         av_log(log_ctx, AV_LOG_ERROR, "Non-existent Parameter Definition with ID %u referenced by a packet\n",
                param->parameter_id);
@@ -2075,6 +2111,20 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
         switch (param->type) {
         case AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN: {
             const AVIAMFMixGain *mix = subblock;
+
+            /* Serialized as the leb128 of whatever value the field holds, and which of the
+             * values below are written is decided by it, so a type the enumeration does
+             * not name is written with the fields of the largest type under it and read
+             * back by nothing: the demuxer's parameter_block_obu() refuses everything past
+             * BEZIER. Refused here for the same reason, rather than emitting a parameter
+             * block this muxer's own demuxer cannot parse. */
+            if (mix->animation_type > AV_IAMF_ANIMATION_TYPE_BEZIER) {
+                av_log(log_ctx, AV_LOG_ERROR, "Mix gain subblock %d carries an invalid "
+                       "animation type %d. Must be at most %d\n", i, mix->animation_type,
+                       AV_IAMF_ANIMATION_TYPE_BEZIER);
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
 
             /* Every rational this subblock serializes is checked before the first one is
              * written, so a subblock carrying one that cannot be scaled leaves no partial
@@ -2202,31 +2252,35 @@ fail:
 int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
                                    const AVPacket *pkt, void *log_ctx)
 {
+    /* Every block is this side data read in place, so the size it is carried with is taken
+     * along with it: that size is all that bounds what may be read out of a structure a
+     * caller laid out. Set to zero for side data a packet does not carry, and then unused. */
+    size_t mix_size, demix_size, recon_size;
     AVIAMFParamDefinition *mix =
         (AVIAMFParamDefinition *)av_packet_get_side_data(pkt,
                                                          AV_PKT_DATA_IAMF_MIX_GAIN_PARAM,
-                                                         NULL);
+                                                         &mix_size);
     AVIAMFParamDefinition *demix =
         (AVIAMFParamDefinition *)av_packet_get_side_data(pkt,
                                                          AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM,
-                                                         NULL);
+                                                         &demix_size);
     AVIAMFParamDefinition *recon =
         (AVIAMFParamDefinition *)av_packet_get_side_data(pkt,
                                                          AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
-                                                         NULL);
+                                                         &recon_size);
 
     if (mix) {
-        int ret = write_parameter_block(iamf, pb, mix, log_ctx);
+        int ret = write_parameter_block(iamf, pb, mix, mix_size, log_ctx);
         if (ret < 0)
            return ret;
     }
     if (demix) {
-        int ret = write_parameter_block(iamf, pb, demix, log_ctx);
+        int ret = write_parameter_block(iamf, pb, demix, demix_size, log_ctx);
         if (ret < 0)
             return ret;
     }
     if (recon) {
-        int ret = write_parameter_block(iamf, pb, recon, log_ctx);
+        int ret = write_parameter_block(iamf, pb, recon, recon_size, log_ctx);
         if (ret < 0)
            return ret;
     }

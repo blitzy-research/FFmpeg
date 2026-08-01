@@ -288,6 +288,7 @@ enum BadEnum {
     BAD_ENUM_HEADPHONES,        /**< headphones_rendering_mode          */
     BAD_ENUM_LAYOUT_TYPE,       /**< a submix layout's layout_type      */
     BAD_ENUM_SIDE_DATA_TYPE,    /**< a parameter block's type field     */
+    BAD_ENUM_ANIMATION_TYPE,    /**< a mix gain subblock's animation    */
     BAD_ENUM_NB
 };
 
@@ -316,7 +317,7 @@ static const int sample_rates[4] = { 48000, 44100, 16000, 96000 };
  * space fits in this one flat block, so no input has to be longer to reach any
  * part of it, and a shorter one reaches the block's leading knobs.
  */
-#define CONTROL_BLOCK_SIZE 38
+#define CONTROL_BLOCK_SIZE 39
 
 /** A muxing scenario: fuzz-derived controls, each with a default. */
 typedef struct FuzzConfig {
@@ -344,6 +345,8 @@ typedef struct FuzzConfig {
     int split_init;         /**< initialize the output before the header */
     int new_extradata;
     unsigned side_data;     /**< which parameter blocks to attach to packets */
+    int param_truncate;     /**< bytes withheld from an attached block's side data */
+    int param_inflate;      /**< announce subblocks the attached side data lacks */
     int nb_subblocks;
     int sample_rate;
     int frame_size;
@@ -651,6 +654,18 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
      * a definition registered for another. The ids are a byte each and collide
      * by chance already; this makes it happen on purpose. */
     cfg->same_param_id      = v & 1;
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* Bytes withheld from the end of every block attached as side data, and
+     * whether the subblock count it announces is raised past what it then
+     * holds. A block is read in place out of the packet, so the size it is
+     * carried with is all that bounds what may be read out of it: too small a
+     * one has no structure to read, and too high a count no subblock where one
+     * is computed. Both are as much the caller's to choose as the block is. */
+    cfg->param_truncate     = v >> 1;
+    cfg->param_inflate      = v & 1;
 }
 
 static int element_nb_layers(const FuzzConfig *cfg)
@@ -887,8 +902,9 @@ static const char *rejection_reason(const FuzzConfig *cfg)
 
     /* Each of these is serialized into a field of its own width, or selects
      * which serializer runs, and no value outside the enumeration has either.
-     * The parameter block's own type field is likewise left out, reaching the
-     * writer through a packet. */
+     * The two a parameter block carries, its type field and a mix gain
+     * subblock's animation, are likewise left out, reaching the writer through
+     * a packet. */
     if (cfg->bad_enum == BAD_ENUM_ELEMENT_TYPE)
         return "an audio element type outside the enumeration";
     if (cfg->bad_enum == BAD_ENUM_HEADPHONES)
@@ -1599,6 +1615,15 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
             gain->control_point_value = av_make_q(cfg->recon_seed[2], 1 << 8);
             gain->control_point_relative_time = av_make_q(cfg->recon_seed[3],
                                                           1 << 8);
+            /* Serialized as a leb128 of whatever the field holds and deciding
+             * which of the values above are written with it, so a value the
+             * enumeration does not name is written by nothing that reads it
+             * back. Set here rather than seeded above, where the animation is
+             * taken modulo the count of named values. */
+            if (cfg->bad_enum == BAD_ENUM_ANIMATION_TYPE)
+                gain->animation_type =
+                    (enum AVIAMFAnimationType)(AV_IAMF_ANIMATION_TYPE_BEZIER + 1);
+
             /* The first rational the subblock writes, so nothing of the
              * animation is out when it is reached. */
             if (cfg->bad_rational == BAD_RATIONAL_MIX_SUBBLOCK)
@@ -1633,7 +1658,25 @@ static AVIAMFParamDefinition *param_block(enum AVIAMFParamDefinitionType type,
     if (cfg->bad_enum == BAD_ENUM_SIDE_DATA_TYPE)
         param->type = (enum AVIAMFParamDefinitionType)(type + 8);
 
+    /* Raised after the subblocks were filled, so the count announces one the
+     * allocation does not hold and the last is computed past its end. */
+    if (cfg->param_inflate)
+        param->nb_subblocks++;
+
     return param;
+}
+
+/**
+ * Withhold @p truncate bytes from the end of what a block is attached with, one
+ * byte always being kept so the packet still carries the side data. Nothing
+ * else tells the writer where a block read in place ends.
+ */
+static size_t truncated_param_size(size_t size, int truncate)
+{
+    if (!size)
+        return 0;
+
+    return size - FFMIN((size_t)truncate, size - 1);
 }
 
 /**
@@ -1798,6 +1841,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (cfg.side_data & 4)
         mix_block = param_block(AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
                                 &cfg, cfg.mix_id, &mix_size);
+
+    /* What the packets carry, which is not what was allocated when a block is
+     * attached with fewer bytes than it was built with. */
+    recon_size = truncated_param_size(recon_size, cfg.param_truncate);
+    demix_size = truncated_param_size(demix_size, cfg.param_truncate);
+    mix_size   = truncated_param_size(mix_size, cfg.param_truncate);
 
     for (uint32_t it = 0; it < maxiteration && data < end; it++) {
         size_t left = end - data;

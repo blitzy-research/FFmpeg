@@ -43,13 +43,16 @@
  * controls behind one would stay unreachable however long a campaign ran.
  *
  * A session may also be initialized in a step of its own before its header is
- * written, which is what the public API offers and what leaves an audio element
+ * written, which is what the public API offers and what leaves a stream group
  * writable after the muxer has already validated it. A control bit takes that
- * route and another appends layers, either while it is open or after the
- * header, so a configuration reaches the descriptor and parameter block
- * serializers wider than the one the muxer checked; see grow_audio_elements().
- * What the muxer accepts is judged too, by rejection_reason(): a guard that
- * stops refusing an invalid configuration serializes it instead of faulting.
+ * route, and further ones append layers to an audio element, replace a layer it
+ * was validated with, and append a submix, an element or a layout to a mix
+ * presentation, either while the session is open or after the header; see
+ * apply_mutations(). A configuration then reaches the descriptor and parameter
+ * block serializers describing something other than the one the muxer checked.
+ * What the muxer accepts is judged too, by rejection_reason() and by those
+ * changes: a guard that stops refusing an invalid configuration serializes it
+ * instead of faulting.
  *
  * A libFuzzer toolchain is what links this target:
  *   ./configure --toolchain=clang-asan-fuzz --assert-level=2 --enable-gpl \
@@ -269,7 +272,7 @@ static const int sample_rates[4] = { 48000, 44100, 16000, 96000 };
  * space fits in this one flat block, so no input has to be longer to reach any
  * part of it, and a shorter one reaches the block's leading knobs.
  */
-#define CONTROL_BLOCK_SIZE 30
+#define CONTROL_BLOCK_SIZE 31
 
 /** A muxing scenario: fuzz-derived controls, each with a default. */
 typedef struct FuzzConfig {
@@ -306,6 +309,8 @@ typedef struct FuzzConfig {
     int io_buffer_size;
     int max_pkt_size;
     int grow_layers;        /**< layers appended once validated, 0 to 8 */
+    int mutate_layer;       /**< how an already validated layer is replaced */
+    unsigned grow_mix;      /**< what is appended to an already validated mix */
     uint8_t recon_seed[8];  /**< expanded into the recon gain matrix */
 } FuzzConfig;
 
@@ -411,6 +416,12 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     cfg->chain              = ((!!(flags3 & 0x04) << 1) | cfg->chain) %
                               FF_ARRAY_ELEMS(scalable_chains);
     cfg->split_init         = !!(flags3 & 0x08);
+    /* None, a valid layout of another channel count, or one no loudspeaker
+     * layout describes, put over a layer the muxer has already validated. This
+     * shares a byte with the knobs above rather than taking one of its own, so
+     * three bytes already reach it; zeroing the appended layer count below then
+     * leaves a replaced layer as the only thing the muxer did not validate. */
+    cfg->mutate_layer       = ((flags3 >> 4) & 3) % 3;
 
     if (!config_byte(gbc, &v))
         return;
@@ -518,6 +529,15 @@ static void config_parse(FuzzConfig *cfg, GetByteContext *gbc)
     case 2:  cfg->invalid_width =  3; break;
     default: cfg->invalid_width = -1; break;
     }
+
+    if (!config_byte(gbc, &v))
+        return;
+
+    /* What is appended to a mix presentation the muxer has already validated: a
+     * submix, an element, a layout, any combination of the three. Every one of
+     * them is something ff_iamf_add_mix_presentation() would have refused or
+     * registered had it been there, so none of them can be serialized. */
+    cfg->grow_mix           = v & 7;
 }
 
 static int element_nb_layers(const FuzzConfig *cfg)
@@ -855,8 +875,12 @@ static int add_audio_element(AVFormatContext *oc, const FuzzConfig *cfg,
  * included, so nothing downstream tells them apart by inspection; only the
  * count they are counted by differs.
  */
-static int grow_audio_elements(AVFormatContext *oc, const FuzzConfig *cfg)
+static int grow_audio_elements(AVFormatContext *oc, const FuzzConfig *cfg,
+                               const char **reason)
 {
+    if (!cfg->grow_layers)
+        return 0;
+
     for (unsigned i = 0; i < oc->nb_stream_groups; i++) {
         AVStreamGroup *stg = oc->stream_groups[i];
         AVIAMFAudioElement *ae;
@@ -885,9 +909,203 @@ static int grow_audio_elements(AVFormatContext *oc, const FuzzConfig *cfg)
                 layer->flags |= AV_IAMF_LAYER_FLAG_RECON_GAIN;
             layer->output_gain_flags = cfg->output_gain_flags;
         }
+
+        if (!*reason)
+            *reason = "layers appended past the count the muxer validated";
     }
 
     return 0;
+}
+
+/**
+ * Replace a layer the muxer has already validated with a different one.
+ *
+ * Appending layers is caught by the count alone. This leaves the count as it
+ * was and changes a layer that count covers, so what the descriptor serializes
+ * for that layer and what the layer was accounted for come from two different
+ * layouts, with nothing about the element saying so afterwards.
+ *
+ * The two forms are the two ways that goes wrong, and they are deliberately
+ * exclusive so that each reaches the check it is aimed at:
+ *
+ * - A layout that is perfectly valid on its own, carrying a channel count the
+ *   replaced one did not. The substream counts recorded for the layer still
+ *   describe the channels the old layout added, so the layer's own accounting
+ *   is what has to be measured for this to be noticed at all.
+ * - A layout carrying the same channel count, leaving the accounting intact,
+ *   but naming one channel over and over. No loudspeaker layout describes it,
+ *   since every entry of either table carries each of its channels once, so the
+ *   descriptor writer has nothing to serialize the layer as. Only put over a
+ *   channel based element, a scene based one being described by its custom
+ *   order map itself rather than by a layout matched to it.
+ */
+static int mutate_audio_elements(AVFormatContext *oc, const FuzzConfig *cfg,
+                                 const char **reason)
+{
+    if (!cfg->mutate_layer)
+        return 0;
+
+    for (unsigned i = 0; i < oc->nb_stream_groups; i++) {
+        AVStreamGroup *stg = oc->stream_groups[i];
+        AVChannelLayout *ch_layout;
+        AVIAMFAudioElement *ae;
+        int nb_channels, ret;
+
+        if (stg->type != AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT)
+            continue;
+
+        ae = stg->params.iamf_audio_element;
+        /* An element validated with no layer at all has none to replace, and
+         * was refused for having none. */
+        if (!ae->nb_layers)
+            continue;
+
+        ch_layout   = &ae->layers[0]->ch_layout;
+        nb_channels = ch_layout->nb_channels;
+
+        if (cfg->mutate_layer == 1) {
+            /* Three channels, or two where the layer already carries three: no
+             * layout here carries both counts, so the accounting always
+             * moves. */
+            const AVChannelLayout *replacement = nb_channels == 3 ?
+                                                 &substream_layouts[2] :
+                                                 &substream_layouts[3];
+
+            /* Releases what the layer held, so no custom order map leaks. */
+            ret = av_channel_layout_copy(ch_layout, replacement);
+            if (ret < 0)
+                return ret;
+
+            if (!*reason)
+                *reason = "a validated layer replaced with a layout of another "
+                          "channel count";
+        } else if (nb_channels > 0 &&
+                   ae->audio_element_type ==
+                   AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL) {
+            /* Copying does this first; a custom layout's own initializer does
+             * not. */
+            av_channel_layout_uninit(ch_layout);
+            ret = av_channel_layout_custom_init(ch_layout, nb_channels);
+            if (ret < 0)
+                return ret;
+
+            for (int j = 0; j < nb_channels; j++)
+                ch_layout->u.map[j].id = AV_CHAN_FRONT_LEFT;
+
+            if (!*reason)
+                *reason = "a validated layer replaced with a layout no "
+                          "loudspeaker layout describes";
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Grow a mix presentation the muxer has already validated.
+ *
+ * ff_iamf_add_mix_presentation() requires a mix configuration on every submix
+ * and every element it is given, and registers a parameter definition for each,
+ * so what it validated is a graph carrying one everywhere. A submix or an
+ * element appended afterwards carries none at all, and a layout appended
+ * afterwards may describe a channel layout no sound system does. All three are
+ * read while serializing a mix presentation, which comes after the Sequence
+ * Header, the Codec Configs and the Audio Elements, so objecting to them only
+ * then is objecting to them too late.
+ */
+static int grow_mix_presentations(AVFormatContext *oc, const FuzzConfig *cfg,
+                                  const char **reason)
+{
+    if (!cfg->grow_mix)
+        return 0;
+
+    for (unsigned i = 0; i < oc->nb_stream_groups; i++) {
+        AVStreamGroup *stg = oc->stream_groups[i];
+        AVIAMFMixPresentation *mix;
+        AVIAMFSubmix *submix;
+
+        if (stg->type != AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION)
+            continue;
+
+        mix = stg->params.iamf_mix_presentation;
+
+        if (cfg->grow_mix & 1) {
+            if (!av_iamf_mix_presentation_add_submix(mix))
+                return AVERROR(ENOMEM);
+
+            if (!*reason)
+                *reason = "a submix appended with no output mix configuration";
+        }
+
+        /* Read after the append above, which may have moved the array. */
+        if (!mix->nb_submixes)
+            continue;
+        submix = mix->submixes[0];
+
+        if (cfg->grow_mix & 2) {
+            AVIAMFSubmixElement *element = av_iamf_submix_add_element(submix);
+
+            if (!element)
+                return AVERROR(ENOMEM);
+
+            /* An audio element that does exist, so the mix configuration this
+             * element has none of is the only thing left to object to. */
+            element->audio_element_id = 1;
+
+            if (!*reason)
+                *reason = "a submix element appended with no mix configuration";
+        }
+
+        if (cfg->grow_mix & 4) {
+            AVIAMFSubmixLayout *layout = av_iamf_submix_add_layout(submix);
+            int ret;
+
+            if (!layout)
+                return AVERROR(ENOMEM);
+
+            layout->layout_type = AV_IAMF_SUBMIX_LAYOUT_TYPE_LOUDSPEAKERS;
+            /* One channel named five times, as in a replaced layer above: every
+             * sound system carries each of its channels once, so none of them
+             * describes this and the layout has no value to be written as. */
+            av_channel_layout_uninit(&layout->sound_system);
+            ret = av_channel_layout_custom_init(&layout->sound_system, 5);
+            if (ret < 0)
+                return ret;
+
+            for (int j = 0; j < layout->sound_system.nb_channels; j++)
+                layout->sound_system.u.map[j].id = AV_CHAN_FRONT_LEFT;
+
+            if (!*reason)
+                *reason = "a submix layout appended that no sound system "
+                          "describes";
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Apply every change the scenario asks of a session the muxer has already
+ * validated, reporting the first one applied.
+ *
+ * @param reason receives why the resulting session cannot be muxed, left alone
+ *               when nothing was changed. Only set for a change that did take
+ *               effect, so a scenario asking for one the session has nowhere to
+ *               apply is never reported.
+ */
+static int apply_mutations(AVFormatContext *oc, const FuzzConfig *cfg,
+                           const char **reason)
+{
+    int ret = grow_audio_elements(oc, cfg, reason);
+
+    if (ret < 0)
+        return ret;
+
+    ret = mutate_audio_elements(oc, cfg, reason);
+    if (ret < 0)
+        return ret;
+
+    return grow_mix_presentations(oc, cfg, reason);
 }
 
 /**
@@ -1072,6 +1290,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     AVIOContext *fuzzed_pb;
     AVPacket *pkt = NULL;
     IOContext opaque = { 0 };
+    const char *late_reason = NULL;
+    int rewrites_descriptors = 0;
     const char *reason;
     const uint8_t *end;
     uint8_t *io_buffer;
@@ -1145,16 +1365,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* An invalid stream group configuration is refused while the output is
      * initialized, which avformat_write_header() does on its own. Doing that as
      * a separate step first is equally supported and leaves the session usable
-     * in between, which is when the elements grow: the descriptors the header
-     * writes are then serialized from a configuration wider than the validated
-     * one. Growing after the header instead leaves that to the trailer, which
-     * serializes them a second time, so the two routes are taken apart. */
+     * in between, which is when the stream groups are changed: the descriptors
+     * the header writes are then serialized from a configuration other than the
+     * validated one. Changing them after the header instead leaves that to the
+     * trailer, which serializes them a second time, so the two routes are taken
+     * apart. */
     if (cfg.split_init) {
         ret = avformat_init_output(oc, NULL);
         if (ret < 0)
             goto fail;
 
-        ret = grow_audio_elements(oc, &cfg);
+        ret = apply_mutations(oc, &cfg, &reason);
         if (ret < 0)
             goto fail;
     }
@@ -1176,7 +1397,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         goto fail;
 
     if (!cfg.split_init) {
-        ret = grow_audio_elements(oc, &cfg);
+        ret = apply_mutations(oc, &cfg, &late_reason);
         if (ret < 0)
             goto fail;
     }
@@ -1244,10 +1465,28 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             error("Failed to allocate new extradata side data");
 
         memcpy(side_data, opus_head, sizeof(opus_head));
-        av_interleaved_write_frame(oc, pkt);
+        /* Flushed straight away, as an interleaved packet is otherwise held
+         * back until the trailer and whether the muxer received it before the
+         * trailer ran would be unknown. Both calls succeeding means it did, so
+         * a seekable output has its descriptors serialized a second time. */
+        if (av_interleaved_write_frame(oc, pkt) >= 0 &&
+            av_interleaved_write_frame(oc, NULL) >= 0)
+            rewrites_descriptors = cfg.seekable;
     }
 
-    av_write_trailer(oc);
+    ret = av_write_trailer(oc);
+
+    /*
+     * The same reading as above, for a session changed after the header
+     * instead: that second pass over the descriptor serializer is where a
+     * change made once the header was written is first read back, so it is
+     * where such a change has to be refused. Serializing it there means a
+     * descriptor describing other than the validated configuration has replaced
+     * a correct one already written, which the first pass having been correct
+     * does nothing to excuse.
+     */
+    if (late_reason && rewrites_descriptors && ret >= 0)
+        report_finding(late_reason);
 
 fail:
     av_packet_free(&pkt);

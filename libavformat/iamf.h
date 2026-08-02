@@ -32,6 +32,8 @@
 #include "libavcodec/codec_par.h"
 
 #define MAX_IAMF_OBU_HEADER_SIZE (1 + 8 * 3)
+// IAMF's six-layer limit (section 3.6.2) matches AVIAMFReconGain.recon_gain's rows.
+#define MAX_IAMF_LAYERS 6
 
 // OBU types (section 3.2).
 enum IAMF_OBU_Type {
@@ -77,6 +79,17 @@ typedef struct IAMFCodecConfig {
 typedef struct IAMFLayer {
     unsigned int substream_count;
     unsigned int coupled_substream_count;
+
+    // mux
+    /**
+     * Whether the AVIAMFLayer this was derived from carried
+     * AV_IAMF_LAYER_FLAG_RECON_GAIN when the Audio Element was added, which is
+     * what the descriptor declares for the layer. Held here because that
+     * AVIAMFLayer stays writable through the caller's stream group, while the
+     * parameter blocks referring back to it are written one packet at a time,
+     * long after the descriptor was serialized.
+     */
+    int recon_gain_present;
 } IAMFLayer;
 
 typedef struct IAMFSubStream {
